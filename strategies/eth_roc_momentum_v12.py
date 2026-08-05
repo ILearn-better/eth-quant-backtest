@@ -63,10 +63,10 @@ class EthROCMomentumV12(BaseStrategy):
     LEVERAGE = 3
     FRACTION_BASE = 0.3       # 基础仓位比例
     FEE_RATE = 0.0004         # 手续费率
-    SL_USDT = 3.0             # 硬止损 3U
+    SL_USDT = 5.0             # 硬止损 5U (参数优化: 3U→5U, 样本外验证有效)
     MAX_HOLD_BARS = 72        # 最大持仓72根K线(3天)
 
-    ROC_SHORT = 5             # 短期ROC周期
+    ROC_SHORT = 8             # 短期ROC周期 (参数优化: 5→8, 样本外验证有效)
     ROC_MEDIUM = 20           # 中期ROC周期
     VOL_MA_PERIOD = 20        # 成交量均线周期
 

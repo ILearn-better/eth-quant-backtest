@@ -44,14 +44,14 @@ REST_KLINE_URL = "https://data-api.binance.vision/api/v3/klines"
 HISTORY_BARS = 300       # 历史回补根数 (足够预热 ROC20 + VolMA20)
 RECONNECT_DELAY = 5      # 断线重连延迟 (秒)
 
-# ---- v12 策略参数 (与 eth_roc_momentum_v12.py 一致) ----
+# ---- v12 策略参数 (与 eth_roc_momentum_v12.py 一致, 2026-08-05参数优化) ----
 CAPITAL = 150.0
 LEVERAGE = 3
 FRACTION_BASE = 0.3
 FEE_RATE = 0.0004
-SL_USDT = 3.0
+SL_USDT = 5.0
 MAX_HOLD_BARS = 72
-ROC_SHORT = 5
+ROC_SHORT = 8
 ROC_MEDIUM = 20
 VOL_MA_PERIOD = 20
 
