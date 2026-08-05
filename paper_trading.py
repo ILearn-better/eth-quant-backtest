@@ -22,13 +22,26 @@ import datetime
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 
 import numpy as np
 import websocket
 
-# ==================== 配置 ====================
+# ---- 加载环境变量 (.env) ----
+def _load_env():
+    env_file = os.path.join(BASE_DIR, ".env")
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_load_env()
+
+# ==================== 配置 ====================
 STATE_FILE = os.path.join(BASE_DIR, "paper_state", "state.json")
 LOG_FILE = os.path.join(BASE_DIR, "paper_state", "trades.jsonl")
 SNAPSHOT_FILE = os.path.join(BASE_DIR, "paper_state", "daily_snapshots.jsonl")
@@ -61,6 +74,29 @@ DRAWDOWN_THRESHOLDS = [
     (0.30, 0.5),
     (1.00, 0.3),
 ]
+
+# ---- 微信通知 (Server酱) ----
+WX_SENDKEY = os.environ.get("WX_SENDKEY", "")
+
+def wx_notify(title, content):
+    """通过 Server酱 发送微信消息"""
+    if not WX_SENDKEY:
+        return
+    try:
+        url = f"https://sctapi.ftqq.com/{WX_SENDKEY}.send"
+        data = urllib.parse.urlencode({
+            "title": title,
+            "desp": content,
+        }).encode("utf-8")
+        proxy = urllib.request.ProxyHandler({
+            "http": f"http://{PROXY_HOST}:{PROXY_PORT}",
+            "https": f"http://{PROXY_HOST}:{PROXY_PORT}",
+        })
+        opener = urllib.request.build_opener(proxy)
+        req = urllib.request.Request(url, data=data, method="POST")
+        opener.open(req, timeout=10)
+    except Exception as e:
+        print(f"  ⚠️ 微信通知发送失败: {e}")
 
 
 # ==================== 工具函数 ====================
@@ -223,6 +259,13 @@ class PaperAccount:
         self.balance -= open_fee  # 开仓手续费从权益扣除
         print(f"  ✅ [{now_str()}] 开仓 {'做多' if direction=='long' else '做空'} @ {price:.2f} "
               f"| 名义{notional:.2f}U (3x) | ROC5={roc5:.2f} ROC20={roc20:.2f} | 手续费{open_fee:.4f}U")
+        # 微信通知
+        dir_label = "📈 做多" if direction == "long" else "📉 做空"
+        wx_notify(
+            f"{dir_label} @ {price:.2f} | 权益 {self.balance:.2f}U",
+            f"方向: {dir_label}\n价格: {price:.2f} USDT\n名义仓位: {notional:.2f}U ({LEVERAGE}x杠杆)\n"
+            f"ROC(8)={roc5:.2f} ROC(20)={roc20:.2f}\n手续费: {open_fee:.4f}U\n权益: {self.balance:.2f}U"
+        )
         self.save()
         return True
 
@@ -260,6 +303,18 @@ class PaperAccount:
         print(f"  🔔 [{now_str()}] 平仓 {'做多' if pos['direction']=='long' else '做空'} "
               f"@{price:.2f} | 盈亏{net_pnl:+.4f}U | 持仓{held_bars}根 | 原因:{reason} "
               f"| 权益={self.balance:.2f}U")
+        # 微信通知
+        dir_label = "🔺" if pos['direction'] == 'long' else "🔻"
+        emoji = "🟢" if net_pnl >= 0 else "🔴"
+        reason_map = {"momentum_death": "动量衰竭", "SL": "止损", "SL(catchup)": "止损(补跑)",
+                      "timeout": "超时", "timeout(catchup)": "超时(补跑)"}
+        reason_cn = reason_map.get(reason, reason)
+        wx_notify(
+            f"{emoji} 平仓{dir_label} | {net_pnl:+.2f}U | 权益 {self.balance:.2f}U",
+            f"方向: {dir_label}\n平仓价: {price:.2f}\n"
+            f"盈亏: {net_pnl:+.2f}U | 持仓: {held_bars}根K线\n"
+            f"原因: {reason_cn}\n权益: {self.balance:.2f}U"
+        )
         self.position = None
         self.save()
 
