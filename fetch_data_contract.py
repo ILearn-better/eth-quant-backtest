@@ -1,18 +1,24 @@
-"""下载 ETHUSDT 近5年 1h K线数据 - Binance API"""
+"""下载 ETHUSDT 合约(USDⓈ-M Futures) 近5年 1h K线数据 - Binance Futures API
+
+数据源: datasource.FUTURES (fapi.binance.com)
+输出: data/futures/ETHUSDT-1h.csv (独立目录, 不污染现货 data/)
+"""
 import csv
 import os
 import time
 import sys
 
+from datasource import FUTURES
+
 SYMBOL = "ETHUSDT"
 INTERVAL = "1h"
-OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ETHUSDT-1h.csv")
+OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "futures", "ETHUSDT-1h.csv")
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 
 
 def fetch_klines(start_time, end_time, limit=1000):
     import requests
-    url = "https://api.binance.com/api/v3/klines"
+    url = FUTURES["rest_kline"]
     params = {"symbol": SYMBOL, "interval": INTERVAL, "startTime": start_time, "endTime": end_time, "limit": limit}
     proxies = {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}
     resp = requests.get(url, params=params, timeout=60, proxies=proxies)
@@ -26,7 +32,7 @@ def download():
     all_klines = []
     current = start_ms
     batch = 0
-    print(f"{'='*60}\n下载 {SYMBOL} {INTERVAL} (近5年)\n目标: {time.strftime('%Y-%m-%d', time.localtime(start_ms/1000))} ~ now\n{'='*60}")
+    print(f"{'='*60}\n下载 {SYMBOL} {FUTURES['name']} {INTERVAL} (近5年)\n数据源: {FUTURES['rest_kline']}\n目标: {time.strftime('%Y-%m-%d', time.localtime(start_ms/1000))} ~ now\n{'='*60}")
 
     while current < now_ms:
         batch += 1

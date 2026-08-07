@@ -478,11 +478,19 @@ def plot_trade_klines(trades, kline_data, output_path,
     return output_path
 
 def generate_html_report(stats, trades, equity_curve, symbol="ETHUSDT",
-                          interval="1h", output_dir="reports", kline_df=None):
-    """生成 HTML 回测报告 (图表用 matplotlib 预渲染为 PNG)"""
+                          interval="1h", output_dir="reports", kline_df=None,
+                          market="", data_range="近2年数据"):
+    """生成 HTML 回测报告 (图表用 matplotlib 预渲染为 PNG)
+
+    market:      市场标签(如 "合约"), 非空时在标题/子标题/图表标题追加标注, 默认空=现货行为不变
+    data_range:  数据范围描述, 默认 "近2年数据" (兼容现货); 合约可传 "近5年数据"
+    """
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "charts"), exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 市场标签: 非空时追加 " · 合约" 等, 空时保持原样(现货兼容)
+    market_tag = f" · {market}" if market else ""
+    market_field = f" | {market}" if market else ""
     filename = f"backtest_{symbol}_{interval}_{ts}.html"
     filepath = os.path.join(output_dir, filename)
     chart_dir = "charts"
@@ -498,19 +506,19 @@ def generate_html_report(stats, trades, equity_curve, symbol="ETHUSDT",
 
     plot_equity_chart(equity_curve, initial_capital,
                        os.path.join(output_dir, eq_img),
-                       title=f"{symbol} RSI策略 - 资金曲线", trades=trades)
+                       title=f"{symbol} RSI策略 - 资金曲线{market_tag}", trades=trades)
     plot_drawdown_chart(equity_curve,
                          os.path.join(output_dir, dd_img),
-                         title=f"{symbol} RSI策略 - 回撤曲线")
+                         title=f"{symbol} RSI策略 - 回撤曲线{market_tag}")
     plot_pnl_distribution(trades,
                            os.path.join(output_dir, pnl_img),
-                           title=f"{symbol} RSI策略 - 盈亏分析")
+                           title=f"{symbol} RSI策略 - 盈亏分析{market_tag}")
     # K线图 (每笔交易的买入点K线)
     kline_path = None
     if kline_df is not None and len(kline_df) > 0:
         kline_path = plot_trade_klines(trades, kline_df,
                                        os.path.join(output_dir, kline_img),
-                                       title=f"{symbol} RSI策略 - 交易K线")
+                                       title=f"{symbol} RSI策略 - 交易K线{market_tag}")
 
     # ===== 构建 HTML =====
     import json
@@ -539,7 +547,7 @@ def generate_html_report(stats, trades, equity_curve, symbol="ETHUSDT",
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ETH RSI 杠杆策略回测报告</title>
+<title>ETH RSI 杠杆策略回测报告{market_tag}</title>
 <style>
 * {{ margin:0; padding:0; box-sizing:border-box; }}
 body {{ font-family:-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif; background:#0f0f14; color:#e0e0e0; padding:20px; }}
@@ -562,8 +570,8 @@ tr:hover td {{ background:#252532; }}
 <body>
 
 <div class="header">
-    <h1>📊 ETH RSI 分仓杠杆策略 回测报告</h1>
-    <div class="sub">{symbol} | {interval} | 近2年数据 | 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+    <h1>📊 ETH RSI 分仓杠杆策略 回测报告{market_tag}</h1>
+    <div class="sub">{symbol} | {interval} | {data_range}{market_field} | 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
 </div>
 
 <div class="grid">

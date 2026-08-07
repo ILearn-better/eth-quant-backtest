@@ -22,8 +22,8 @@ body {
 .stat { text-align: center; }
 .stat .label { font-size: 11px; color: #888; }
 .stat .value { font-size: 20px; font-weight: bold; }
-.stat .value.up { color: #e74c3c; }      /* 中国习惯: 红涨 */
-.stat .value.down { color: #27ae60; }    /* 绿跌 */
+.stat .value.up { color: #e74c3c; }
+.stat .value.down { color: #27ae60; }
 .stat .value.flat { color: #f7931a; }
 .badge {
     padding: 4px 12px; border-radius: 14px; font-size: 12px; font-weight: bold;
@@ -63,8 +63,8 @@ body {
 }
 .signal-item .time { color: #888; }
 .signal-item .price { font-weight: bold; }
-.signal-item .buy { color: #e74c3c; }   /* 买入红 */
-.signal-item .sell { color: #27ae60; }  /* 卖出绿 */
+.signal-item .buy { color: #e74c3c; }
+.signal-item .sell { color: #27ae60; }
 .signal-item .tag {
     font-size: 10px; padding: 2px 6px; border-radius: 4px;
     background: #333; color: #aaa;
@@ -126,13 +126,11 @@ body {
 </div>
 
 <script>
-// ============ 全局状态 ============
 let klineChart, rocChart;
 let wsConn = null;
 let reconnectTimer = null;
 const MAX_POINTS = 300;
 
-// ============ 初始化图表 ============
 function initCharts() {
     klineChart = echarts.init(document.getElementById('mainChart'));
     rocChart = echarts.init(document.getElementById('rocChart'));
@@ -142,14 +140,11 @@ function initCharts() {
     });
 }
 
-// ============ 更新K线图 ============
 function updateMainChart(data) {
     const klines = data.klines;
     const times = klines.map(k => new Date(k[0]).toLocaleString('zh-CN', {
         month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
     }));
-
-    // 信号标记: 买入/做空入场用三角形
     const buyPts = (data.signals || [])
         .filter(s => s.type === 'buy')
         .map(s => ({
@@ -168,7 +163,6 @@ function updateMainChart(data) {
             value: s.pnl >= 0 ? '止盈' : '止损',
             itemStyle: { color: s.pnl >= 0 ? '#e74c3c' : '#27ae60' },
         }));
-
     klineChart.setOption({
         animation: false,
         tooltip: {
@@ -197,7 +191,7 @@ function updateMainChart(data) {
         ],
         series: [
             {
-                name: 'K线', type: 'candlestick', data: klines.map(k => [k[1], k[2], k[3], k[4]]),
+                name: 'K线', type: 'candlestick', data: klines.map(k => [k[1], k[4], k[3], k[2]]), // [open, close, low, high] ECharts 格式
                 itemStyle: {
                     color: '#e74c3c', color0: '#27ae60',
                     borderColor: '#e74c3c', borderColor0: '#27ae60',
@@ -224,7 +218,6 @@ function updateMainChart(data) {
     }, true);
 }
 
-// ============ 更新ROC图 ============
 function updateRocChart(data) {
     const times = data.roc5.map(p => new Date(p[0]).toLocaleString('zh-CN', {
         month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
@@ -252,14 +245,11 @@ function updateRocChart(data) {
     }, true);
 }
 
-// ============ 更新统计面板 ============
 function updateStats(data) {
     const lp = data.last_price;
     const klines = data.klines;
     document.getElementById('lastPrice').textContent = lp.toFixed(2);
     document.getElementById('lastPrice').className = 'value';
-
-    // 24h涨跌 (最近24根K线)
     if (klines.length >= 24) {
         const open24 = klines[klines.length - 24][1];
         const change = (lp - open24) / open24 * 100;
@@ -267,8 +257,6 @@ function updateStats(data) {
         el.textContent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
         el.className = 'value ' + (change > 0 ? 'up' : change < 0 ? 'down' : 'flat');
     }
-
-    // 当前 ROC
     const r5 = data.roc5.length ? data.roc5[data.roc5.length - 1][1] : 0;
     const r20 = data.roc20.length ? data.roc20[data.roc20.length - 1][1] : 0;
     const el5 = document.getElementById('curRoc5');
@@ -277,12 +265,10 @@ function updateStats(data) {
     el5.className = 'value ' + (r5 > 0 ? 'up' : r5 < 0 ? 'down' : 'flat');
     el20.textContent = (r20 >= 0 ? '+' : '') + r20.toFixed(2);
     el20.className = 'value ' + (r20 > 0 ? 'up' : r20 < 0 ? 'down' : 'flat');
-
     document.getElementById('subInfo').textContent =
         '1h K线 | 双ROC动量(8/20) + 成交量确认 | 3x杠杆 | 更新: ' + new Date().toLocaleTimeString('zh-CN');
 }
 
-// ============ 更新参数面板 ============
 function updateParams(data) {
     const p = data.params;
     const map = [
@@ -295,7 +281,6 @@ function updateParams(data) {
     ).join('');
 }
 
-// ============ 更新信号列表 ============
 function updateSignals(data) {
     const sigs = (data.signals || []).slice().reverse().slice(0, 50);
     if (!sigs.length) {
@@ -321,7 +306,6 @@ function updateSignals(data) {
     }).join('');
 }
 
-// ============ 渲染全部 ============
 function renderAll(data) {
     if (!data || !data.klines || !data.klines.length) return;
     updateMainChart(data);
@@ -331,12 +315,10 @@ function renderAll(data) {
     updateSignals(data);
 }
 
-// ============ WebSocket 连接 ============
 function connectWS() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     wsConn = new WebSocket(`${proto}://${location.host}/ws`);
     setConnStatus(false);
-
     wsConn.onopen = () => setConnStatus(true);
     wsConn.onmessage = (e) => {
         const msg = JSON.parse(e.data);
@@ -362,14 +344,12 @@ function setConnStatus(ok) {
     el.className = 'badge ' + (ok ? 'live' : 'off');
 }
 
-// 心跳保持
 setInterval(() => {
     if (wsConn && wsConn.readyState === WebSocket.OPEN) {
         wsConn.send('ping');
     }
 }, 10000);
 
-// ============ 启动 ============
 initCharts();
 connectWS();
 </script>
