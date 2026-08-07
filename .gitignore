@@ -1,0 +1,36 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# ===== 环境变量 (含密钥, 不入库) =====
+.env
+build/
+dist/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== 回测报告 (生成物, 不入库) =====
+reports/
+!reports/.gitkeep
+
+# ===== 模拟盘运行状态 (含交易记录, 不入库) =====
+paper_state/
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== WorkBuddy 项目数据 =====
+.workbuddy/

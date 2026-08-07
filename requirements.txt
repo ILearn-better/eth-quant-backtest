@@ -1,0 +1,6 @@
+# ETHUSDT 量化回测框架依赖
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+websocket-client>=1.6
+requests>=2.28

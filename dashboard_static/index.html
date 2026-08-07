@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETH v12 实时行情面板</title>
+<script src="/static/echarts.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: #0f0f14; color: #e0e0e0; padding: 16px;
+}
+.header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 20px; background: #1a1a24; border-radius: 12px;
+    border: 1px solid #2a2a3a; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;
+}
+.header h1 { font-size: 20px; color: #f7931a; }
+.header .sub { color: #888; font-size: 13px; margin-top: 4px; }
+.stats { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+.stat { text-align: center; }
+.stat .label { font-size: 11px; color: #888; }
+.stat .value { font-size: 20px; font-weight: bold; }
+.stat .value.up { color: #e74c3c; }
+.stat .value.down { color: #27ae60; }
+.stat .value.flat { color: #f7931a; }
+.badge {
+    padding: 4px 12px; border-radius: 14px; font-size: 12px; font-weight: bold;
+    border: 1px solid;
+}
+.badge.live { background: #27ae6022; color: #27ae60; border-color: #27ae6055; }
+.badge.off { background: #ff6b6b22; color: #ff6b6b; border-color: #ff6b6b55; }
+.grid { display: grid; grid-template-columns: 1fr 340px; gap: 14px; }
+@media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
+.chart-box {
+    background: #1a1a24; border-radius: 12px; border: 1px solid #2a2a3a;
+    padding: 12px; margin-bottom: 14px;
+}
+.chart-box h3 {
+    font-size: 14px; color: #fff; margin-bottom: 6px;
+    border-left: 3px solid #f7931a; padding-left: 10px;
+}
+#mainChart { width: 100%; height: 520px; }
+#rocChart { width: 100%; height: 160px; }
+.side-panel { display: flex; flex-direction: column; gap: 14px; }
+.card {
+    background: #1a1a24; border-radius: 12px; border: 1px solid #2a2a3a; padding: 16px;
+}
+.card h3 {
+    font-size: 14px; color: #fff; margin-bottom: 12px;
+    border-left: 3px solid #f7931a; padding-left: 10px;
+}
+.param-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.param { background: #252532; border-radius: 8px; padding: 8px 10px; }
+.param .k { font-size: 11px; color: #888; }
+.param .v { font-size: 15px; font-weight: bold; color: #f7931a; margin-top: 2px; }
+#signalList { max-height: 420px; overflow-y: auto; }
+.signal-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 10px; border-radius: 8px; margin-bottom: 6px;
+    background: #252532; font-size: 12px;
+}
+.signal-item .time { color: #888; }
+.signal-item .price { font-weight: bold; }
+.signal-item .buy { color: #e74c3c; }
+.signal-item .sell { color: #27ae60; }
+.signal-item .tag {
+    font-size: 10px; padding: 2px 6px; border-radius: 4px;
+    background: #333; color: #aaa;
+}
+.empty { color: #666; text-align: center; padding: 20px; }
+#connStatus { font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <div>
+        <h1>📈 ETHUSDT 实时行情 + v12 策略信号</h1>
+        <div class="sub" id="subInfo">1h K线 | 双ROC动量(8/20) + 成交量确认 | 3x杠杆</div>
+    </div>
+    <div class="stats">
+        <div class="stat">
+            <div class="label">最新价</div>
+            <div class="value" id="lastPrice">--</div>
+        </div>
+        <div class="stat">
+            <div class="label">24h涨跌</div>
+            <div class="value" id="change24h">--</div>
+        </div>
+        <div class="stat">
+            <div class="label">ROC(8)</div>
+            <div class="value" id="curRoc5">--</div>
+        </div>
+        <div class="stat">
+            <div class="label">ROC(20)</div>
+            <div class="value" id="curRoc20">--</div>
+        </div>
+        <div class="badge" id="connStatus">连接中...</div>
+    </div>
+</div>
+
+<div class="grid">
+    <div>
+        <div class="chart-box">
+            <h3>K线图 (红色=做多信号 ▲, 绿色=做空信号 ▼, 圆点=出场)</h3>
+            <div id="mainChart"></div>
+        </div>
+        <div class="chart-box">
+            <h3>ROC 动量指标 (红=ROC8, 蓝=ROC20, 0轴为多空分界)</h3>
+            <div id="rocChart"></div>
+        </div>
+    </div>
+
+    <div class="side-panel">
+        <div class="card">
+            <h3>策略参数</h3>
+            <div class="param-grid" id="params"></div>
+        </div>
+        <div class="card">
+            <h3>买卖信号 (历史回放 + 实时)</h3>
+            <div id="signalList"><div class="empty">加载中...</div></div>
+        </div>
+    </div>
+</div>
+
+<script>
+let klineChart, rocChart;
+let wsConn = null;
+let reconnectTimer = null;
+const MAX_POINTS = 300;
+
+function initCharts() {
+    klineChart = echarts.init(document.getElementById('mainChart'));
+    rocChart = echarts.init(document.getElementById('rocChart'));
+    window.addEventListener('resize', () => {
+        klineChart.resize();
+        rocChart.resize();
+    });
+}
+
+function updateMainChart(data) {
+    const klines = data.klines;
+    const times = klines.map(k => new Date(k[0]).toLocaleString('zh-CN', {
+        month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+    }));
+    const buyPts = (data.signals || [])
+        .filter(s => s.type === 'buy')
+        .map(s => ({
+            coord: [new Date(s.t).toLocaleString('zh-CN', {
+                month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+            }), s.price],
+            value: s.direction === 'long' ? '做多' : '做空',
+            itemStyle: { color: s.direction === 'long' ? '#e74c3c' : '#27ae60' },
+        }));
+    const sellPts = (data.signals || [])
+        .filter(s => s.type === 'sell')
+        .map(s => ({
+            coord: [new Date(s.t).toLocaleString('zh-CN', {
+                month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+            }), s.price],
+            value: s.pnl >= 0 ? '止盈' : '止损',
+            itemStyle: { color: s.pnl >= 0 ? '#e74c3c' : '#27ae60' },
+        }));
+    klineChart.setOption({
+        animation: false,
+        tooltip: {
+            trigger: 'axis', axisPointer: { type: 'cross' },
+            backgroundColor: '#1a1a24', borderColor: '#333', textStyle: { color: '#e0e0e0' },
+        },
+        axisPointer: { link: [{ xAxisIndex: 'all' }] },
+        grid: [
+            { left: 60, right: 20, top: 30, height: '62%' },
+            { left: 60, right: 20, top: '78%', height: '14%' },
+        ],
+        xAxis: [
+            { type: 'category', data: times, boundaryGap: true, axisLine: { lineStyle: { color: '#333' } },
+              axisLabel: { color: '#888' }, splitLine: { show: false } },
+            { type: 'category', gridIndex: 1, data: times, boundaryGap: true,
+              axisLabel: { show: false }, axisLine: { lineStyle: { color: '#333' } } },
+        ],
+        yAxis: [
+            { scale: true, splitLine: { lineStyle: { color: '#222' } }, axisLabel: { color: '#888' } },
+            { gridIndex: 1, splitLine: { show: false }, axisLabel: { color: '#888' } },
+        ],
+        dataZoom: [
+            { type: 'inside', xAxisIndex: [0, 1], start: 30, end: 100 },
+            { type: 'slider', xAxisIndex: [0, 1], top: '92%', height: 22,
+              borderColor: '#333', backgroundColor: '#1a1a24', fillerColor: 'rgba(247,147,26,0.15)' },
+        ],
+        series: [
+            {
+                name: 'K线', type: 'candlestick', data: klines.map(k => [k[1], k[4], k[3], k[2]]), // [open, close, low, high] ECharts 格式
+                itemStyle: {
+                    color: '#e74c3c', color0: '#27ae60',
+                    borderColor: '#e74c3c', borderColor0: '#27ae60',
+                },
+            },
+            {
+                name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1,
+                data: klines.map(k => ({
+                    value: k[5],
+                    itemStyle: { color: k[4] >= k[1] ? '#e74c3c88' : '#27ae6088' },
+                })),
+            },
+            {
+                name: '买点', type: 'scatter', symbol: 'triangle', symbolSize: 12,
+                data: buyPts, z: 10,
+                label: { show: true, position: 'top', fontSize: 10, fontWeight: 'bold', color: '#e0e0e0' },
+            },
+            {
+                name: '卖点', type: 'scatter', symbol: 'circle', symbolSize: 10,
+                data: sellPts, z: 10,
+                label: { show: true, position: 'bottom', fontSize: 10, color: '#e0e0e0' },
+            },
+        ],
+    }, true);
+}
+
+function updateRocChart(data) {
+    const times = data.roc5.map(p => new Date(p[0]).toLocaleString('zh-CN', {
+        month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+    }));
+    rocChart.setOption({
+        animation: false,
+        tooltip: { trigger: 'axis', backgroundColor: '#1a1a24', borderColor: '#333', textStyle: { color: '#e0e0e0' } },
+        grid: { left: 60, right: 20, top: 20, bottom: 30 },
+        xAxis: { type: 'category', data: times, axisLine: { lineStyle: { color: '#333' } }, axisLabel: { color: '#888' } },
+        yAxis: { splitLine: { lineStyle: { color: '#222' } }, axisLabel: { color: '#888' } },
+        series: [
+            {
+                name: 'ROC(8)', type: 'line', data: data.roc5.map(p => p[1]),
+                lineStyle: { color: '#e74c3c', width: 1.5 }, itemStyle: { color: '#e74c3c' }, showSymbol: false,
+            },
+            {
+                name: 'ROC(20)', type: 'line', data: data.roc20.map(p => p[1]),
+                lineStyle: { color: '#3498db', width: 1.5 }, itemStyle: { color: '#3498db' }, showSymbol: false,
+            },
+            {
+                name: '0轴', type: 'line', data: data.roc5.map(() => 0),
+                lineStyle: { color: '#555', width: 1, type: 'dashed' }, showSymbol: false,
+            },
+        ],
+    }, true);
+}
+
+function updateStats(data) {
+    const lp = data.last_price;
+    const klines = data.klines;
+    document.getElementById('lastPrice').textContent = lp.toFixed(2);
+    document.getElementById('lastPrice').className = 'value';
+    if (klines.length >= 24) {
+        const open24 = klines[klines.length - 24][1];
+        const change = (lp - open24) / open24 * 100;
+        const el = document.getElementById('change24h');
+        el.textContent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+        el.className = 'value ' + (change > 0 ? 'up' : change < 0 ? 'down' : 'flat');
+    }
+    const r5 = data.roc5.length ? data.roc5[data.roc5.length - 1][1] : 0;
+    const r20 = data.roc20.length ? data.roc20[data.roc20.length - 1][1] : 0;
+    const el5 = document.getElementById('curRoc5');
+    const el20 = document.getElementById('curRoc20');
+    el5.textContent = (r5 >= 0 ? '+' : '') + r5.toFixed(2);
+    el5.className = 'value ' + (r5 > 0 ? 'up' : r5 < 0 ? 'down' : 'flat');
+    el20.textContent = (r20 >= 0 ? '+' : '') + r20.toFixed(2);
+    el20.className = 'value ' + (r20 > 0 ? 'up' : r20 < 0 ? 'down' : 'flat');
+    document.getElementById('subInfo').textContent =
+        '1h K线 | 双ROC动量(8/20) + 成交量确认 | 3x杠杆 | 更新: ' + new Date().toLocaleTimeString('zh-CN');
+}
+
+function updateParams(data) {
+    const p = data.params;
+    const map = [
+        ['ROC 短周期', p.roc_short], ['ROC 中期', p.roc_medium],
+        ['成交量均线', p.vol_ma_period], ['硬止损', p.sl_usdt + 'U'],
+        ['杠杆', p.leverage + 'x'], ['本金', p.capital + 'U'],
+    ];
+    document.getElementById('params').innerHTML = map.map(([k, v]) =>
+        `<div class="param"><div class="k">${k}</div><div class="v">${v}</div></div>`
+    ).join('');
+}
+
+function updateSignals(data) {
+    const sigs = (data.signals || []).slice().reverse().slice(0, 50);
+    if (!sigs.length) {
+        document.getElementById('signalList').innerHTML = '<div class="empty">暂无信号</div>';
+        return;
+    }
+    document.getElementById('signalList').innerHTML = sigs.map(s => {
+        const t = new Date(s.t).toLocaleString('zh-CN', {
+            month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+        });
+        const cls = s.type === 'buy' ? 'buy' : 'sell';
+        const label = s.type === 'buy'
+            ? (s.direction === 'long' ? '▲ 做多开仓' : '▼ 做空开仓')
+            : (s.pnl >= 0 ? '● 止盈平仓' : '● 止损平仓');
+        const reasonMap = { roc_cross: 'ROC交叉', momentum_death: '动量衰竭', SL: '止损', timeout: '超时' };
+        const reason = reasonMap[s.reason] || s.reason;
+        const pnlTxt = s.pnl !== null ? ` ${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}U` : '';
+        return `<div class="signal-item">
+            <span class="time">${t}</span>
+            <span class="${cls}">${label} <span class="price">@${s.price}</span></span>
+            <span class="tag">${reason}${pnlTxt}</span>
+        </div>`;
+    }).join('');
+}
+
+function renderAll(data) {
+    if (!data || !data.klines || !data.klines.length) return;
+    updateMainChart(data);
+    updateRocChart(data);
+    updateStats(data);
+    updateParams(data);
+    updateSignals(data);
+}
+
+function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    wsConn = new WebSocket(`${proto}://${location.host}/ws`);
+    setConnStatus(false);
+    wsConn.onopen = () => setConnStatus(true);
+    wsConn.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'init' || msg.type === 'update') {
+            renderAll(msg.data);
+        }
+    };
+    wsConn.onclose = () => {
+        setConnStatus(false);
+        scheduleReconnect();
+    };
+    wsConn.onerror = () => wsConn.close();
+}
+
+function scheduleReconnect() {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connectWS, 3000);
+}
+
+function setConnStatus(ok) {
+    const el = document.getElementById('connStatus');
+    el.textContent = ok ? '● 实时连接' : '○ 重连中...';
+    el.className = 'badge ' + (ok ? 'live' : 'off');
+}
+
+setInterval(() => {
+    if (wsConn && wsConn.readyState === WebSocket.OPEN) {
+        wsConn.send('ping');
+    }
+}, 10000);
+
+initCharts();
+connectWS();
+</script>
+</body>
+</html>
