@@ -48,11 +48,14 @@ dl_*progress*.txt
 health_check.txt
 net_test.txt
 result_*.txt
+contract_log.txt
+contract_err.txt
 
 # ===== 模拟盘运行状态 (交易记录/余额, 不入库) =====
 data/signals_spot.jsonl
 data/futures/signals_contract.jsonl
 data/futures/state_contract.json
+data/state_spot.json
 
 # ===== 大体积分钟级历史数据 (不入库, 按需另存) =====
 data/futures/ETHUSDT-5m-full.csv
