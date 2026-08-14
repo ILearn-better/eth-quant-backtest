@@ -50,8 +50,17 @@ MARKET_NAME = FUTURES["name"]   # "合约"
 # 数据源 — 来自 datasource.FUTURES, 换数据源只改 datasource.py
 WS_KLINE_URL = FUTURES["ws_kline"]
 WS_TICKER_URL = FUTURES["ws_ticker"]
+WS_AGGTRADE_URL = FUTURES["ws_aggtrade"]
 REST_KLINE_URL = FUTURES["rest_kline"]
 REST_TICKER_URL = FUTURES["rest_ticker"]
+REST_LSR_TOP_URL = FUTURES["rest_long_short_ratio_top"]
+REST_LSR_ACCT_URL = FUTURES["rest_long_short_ratio_acct"]
+LSR_POLL_INTERVAL = 300     # 多空比轮询间隔(秒, 5分钟)
+
+# 大资金流向参数
+LARGE_ORDER_USDT = 100000   # 单笔成交额 ≥ 10万U 算大单
+FLOW_WINDOWS = [5, 15, 60]  # 净买卖统计窗口(分钟)
+LARGE_ORDER_KEEP = 50       # 后端保留大单条数(deque maxlen)
 
 # 服务端口 (与现货 8080 区分, 避免冲突)
 SERVER_PORT = 8081
@@ -60,15 +69,18 @@ HISTORY_BARS = 300
 RECONNECT_DELAY = 5
 PUSH_INTERVAL = 3           # 定时广播间隔(秒), 不依赖 K线收盘
 
-# ---- 合约策略参数 (经验值, 跳过优化; 与 strategies/eth_roc_momentum_contract.py 一致) ----
+# ---- 合约策略参数 (五维共振版, 与 strategies/eth_roc_momentum_contract_resonance.py 一致) ----
 CAPITAL = 150.0
-LEVERAGE = 8
-FRACTION_BASE = 0.25
+LEVERAGE = 20              # 高杠杆: 靠五维共振提高胜率支撑
+FRACTION_BASE = 0.20       # 基础仓位 (20x杠杆下压缩仓位, 有效杠杆4x)
 FEE_RATE = 0.0004
 MAX_HOLD_BARS = 72
 ROC_SHORT = 8
 ROC_MEDIUM = 20
+ROC_LONG = 50              # 2天动量确认 (时间框架共振)
 VOL_MA_PERIOD = 20
+TREND_MA_PERIOD = 50       # 2天趋势线 (时间框架共振)
+ATR_STATE_PERIOD = 50      # ATR 状态均线 (波动放大期判断)
 
 # 动量衰竭阈值: 0=穿零即出 (原0.8经验值导致利润回吐太重, 改回v12逻辑)
 MOMENTUM_DEATH_THRESH = 0
@@ -139,9 +151,113 @@ def calc_ma(values, period):
     ma = np.full(len(values), np.nan)
     if len(values) < period:
         return ma
-    cumsum = np.cumsum(values)
+    # NaN 前缀(如 ATR 的 index 0)不传播: 用 0 填充后 nancumsum, 与回测策略 calc_ma 保持一致
+    cumsum = np.nancumsum(np.where(np.isnan(values), 0, values))
     ma[period - 1:] = (cumsum[period - 1:] - np.concatenate([[0], cumsum[:-period]])) / period
     return ma
+
+
+# ---- 趋势判断 (MA20/MA50 排列 + 间距 + 斜率) ----
+def analyze_trend(closes):
+    """三分类趋势: 上升/震荡/下降.
+    规则: |MA20-MA50|/MA50 < 0.3% → 震荡(均线纠缠);
+          MA20>MA50 且价≥MA20 → 上升;  MA20<MA50 且价≤MA20 → 下降; 其余为震荡.
+    """
+    n = len(closes)
+    unknown = {"trend": "unknown", "label": "--", "ma_fast": None,
+               "ma_slow": None, "spread_pct": None, "slope_pct": None}
+    if n < 60:
+        return unknown
+    ma_fast = calc_ma(closes, 20)
+    ma_slow = calc_ma(closes, 50)
+    cf, cs = ma_fast[-1], ma_slow[-1]
+    if np.isnan(cf) or np.isnan(cs) or cs == 0:
+        return unknown
+    price = closes[-1]
+    slope = (ma_fast[-1] - ma_fast[-6]) / ma_fast[-6] * 100 if ma_fast[-6] != 0 else 0.0
+    spread = (cf - cs) / cs * 100
+    if abs(spread) < 0.3:
+        trend, label = "sideways", "震荡"
+    elif cf > cs and price >= cf:
+        trend, label = "up", "上升"
+    elif cf < cs and price <= cf:
+        trend, label = "down", "下降"
+    else:
+        trend, label = "sideways", "震荡"
+    return {
+        "trend": trend, "label": label,
+        "ma_fast": round(float(cf), 2), "ma_slow": round(float(cs), 2),
+        "spread_pct": round(float(spread), 3), "slope_pct": round(float(slope), 3),
+    }
+
+
+# ---- 支撑/突破位 (swing low/high 聚类) ----
+def _find_levels(bars, closes, use_high, lookback=150, k=3, max_levels=2, tol=0.004, below=True):
+    """通用: 找最近 lookback 根内的摆动极值(use_high=True→swing high),
+    聚类(±0.4%), 按方向筛选(支撑=低于现价 / 突破=高于现价),
+    返回最新的最多 max_levels 个. 返回: [{"price": float, "ts": int}] (按时间从新到旧)
+    """
+    n = len(bars)
+    if n < 2 * k + 5:
+        return []
+    lo = max(0, n - lookback)
+    arr = [b["h"] if use_high else b["l"] for b in bars]
+    price = closes[-1]
+    if use_high:
+        pivots = [(bars[i]["t"], arr[i]) for i in range(lo + k, n - k)
+                  if arr[i] > max(arr[i - k:i]) and arr[i] > max(arr[i + 1:i + k + 1])]
+    else:
+        pivots = [(bars[i]["t"], arr[i]) for i in range(lo + k, n - k)
+                  if arr[i] < min(arr[i - k:i]) and arr[i] < min(arr[i + 1:i + k + 1])]
+    if not pivots:
+        return []
+    # 按价格升序聚类合并 (支撑取更低, 突破取更高)
+    pivots.sort(key=lambda x: x[1])
+    levels = []
+    for ts, p in pivots:
+        hit = None
+        for lv in levels:
+            if abs(p - lv["price"]) / lv["price"] < tol:
+                hit = lv
+                break
+        if hit is not None:
+            hit["price"] = max(hit["price"], p) if use_high else min(hit["price"], p)
+            hit["ts"] = max(hit["ts"], ts)
+        else:
+            levels.append({"price": p, "ts": ts})
+    if below:
+        sel = [lv for lv in levels if lv["price"] < price]
+    else:
+        sel = [lv for lv in levels if lv["price"] > price]
+    sel.sort(key=lambda x: x["ts"], reverse=True)
+    return [{"price": round(float(lv["price"]), 2), "ts": int(lv["ts"])} for lv in sel[:max_levels]]
+
+
+def find_supports(bars, closes, lookback=150, k=3, max_levels=2, tol=0.004):
+    """支撑位: 低于现价的摆动低点聚类"""
+    return _find_levels(bars, closes, use_high=False, lookback=lookback, k=k,
+                        max_levels=max_levels, tol=tol, below=True)
+
+
+def find_resistances(bars, closes, lookback=150, k=3, max_levels=2, tol=0.004):
+    """突破位(压力): 高于现价的摆动高点聚类"""
+    return _find_levels(bars, closes, use_high=True, lookback=lookback, k=k,
+                        max_levels=max_levels, tol=tol, below=False)
+
+
+# ---- 布林带 (BOLL 20, 2σ) ----
+def calc_boll(closes, period=20, mult=2.0):
+    """布林带: 返回 (upper, mid, lower) 三个 np 数组, 与 calc_ma 同为 NaN 前缀.
+    mid = MA(period);  std = sqrt(MA(close^2) - mid^2)
+    """
+    closes = np.asarray(closes, dtype=float)
+    mid = calc_ma(closes, period)
+    sq = calc_ma(closes * closes, period)
+    var = sq - mid * mid
+    std = np.sqrt(np.clip(var, 0.0, None))
+    upper = mid + mult * std
+    lower = mid - mult * std
+    return upper, mid, lower
 
 
 def calc_atr(highs, lows, closes, period):
@@ -193,6 +309,77 @@ class LiveTrader:
         self.peak_balance = CAPITAL   # 资金峰值 (用于回撤减仓)
         self.trade_history = []       # 已平仓交易历史
         self.bar_counter = 0          # K线计数 (用于 entry_bar 计算)
+
+        # 大资金流向 (aggTrade 大单聚合 + 合约多空比)
+        from collections import deque
+        self.large_orders = deque(maxlen=LARGE_ORDER_KEEP)
+        self.flow_window = deque(maxlen=5000)
+        self.long_short_ratio = None    # 合约多空比(轮询填充)
+
+        # 启动时恢复历史信号 + 持仓状态(避免重启丢失信号 / 持仓断链)
+        self._load_state()
+
+    # ---- 持久化: 信号 JSONL + 持仓状态 JSON ----
+    def _signal_file(self):
+        return os.path.join(BASE_DIR, "data", "futures", "signals_contract.jsonl")
+
+    def _state_file(self):
+        return os.path.join(BASE_DIR, "data", "futures", "state_contract.json")
+
+    def _append_signal_jsonl(self, signal):
+        """追加一条信号到 JSONL 文件(失败只警告, 不阻断信号链路)"""
+        try:
+            with open(self._signal_file(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(signal, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"  ⚠️ [{now()}] 信号落盘失败: {e}")
+
+    def _save_state(self):
+        """原子写入持仓状态(position=None 也会写入, 等于清空持仓记录)"""
+        st = {
+            "position": self.position,
+            "balance": self.balance,
+            "peak_balance": self.peak_balance,
+            "bar_counter": self.bar_counter,
+            "trade_history": self.trade_history,
+        }
+        tmp = self._state_file() + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._state_file())
+        except Exception as e:
+            print(f"  ⚠️ [{now()}] 持仓状态落盘失败: {e}")
+
+    def _load_state(self):
+        """启动时加载历史信号(最近1000条)+ 恢复持仓状态"""
+        # 1. 历史信号
+        try:
+            with open(self._signal_file(), encoding="utf-8") as f:
+                lines = f.readlines()
+            self.signal_log = [json.loads(l) for l in lines[-1000:] if l.strip()]
+            print(f"  📂 已加载 {len(self.signal_log)} 条历史信号 (data/futures/signals_contract.jsonl)")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"  ⚠️ 加载历史信号失败: {e}")
+        # 2. 持仓状态
+        try:
+            with open(self._state_file(), encoding="utf-8") as f:
+                st = json.load(f)
+            self.balance = st.get("balance", CAPITAL)
+            self.peak_balance = st.get("peak_balance", CAPITAL)
+            self.bar_counter = st.get("bar_counter", 0)
+            self.trade_history = st.get("trade_history", [])
+            if st.get("position"):
+                self.position = st["position"]
+                p = self.position
+                print(f"  ⚠️ 检测到未平仓位: {p['direction']} @ {p['entry_price']} USDT")
+                print(f"  ⚠️ 已自动恢复持仓跟踪。如已手动平仓, 请删除 data/futures/state_contract.json 后重启")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"  ⚠️ 加载持仓状态失败: {e}")
 
     # ---- REST: 历史K线回补 ----
     def _rest_get(self, url, timeout=15):
@@ -255,9 +442,12 @@ class LiveTrader:
         vols = np.array([b["v"] for b in bars])
         roc5 = calc_roc(closes, ROC_SHORT)
         roc20 = calc_roc(closes, ROC_MEDIUM)
+        roc50 = calc_roc(closes, ROC_LONG)
         vol_ma = calc_ma(vols, VOL_MA_PERIOD)
+        trend_ma = calc_ma(closes, TREND_MA_PERIOD)
         atr = calc_atr(highs, lows, closes, ATR_PERIOD)
-        return closes, vols, roc5, roc20, vol_ma, atr
+        atr_state = calc_ma(atr, ATR_STATE_PERIOD)
+        return closes, vols, roc5, roc20, roc50, vol_ma, trend_ma, atr, atr_state
 
     # ---- 仓位管理辅助 ----
     def _get_position_size(self, drawdown):
@@ -294,6 +484,7 @@ class LiveTrader:
             "sl_price": round(float(sl_price), 2),
             "tp_price": round(float(tp_price), 2),
         }
+        self._save_state()                    # 持仓状态落盘
         return self.position
 
     def _close_position(self, exit_price, reason, ts):
@@ -319,11 +510,30 @@ class LiveTrader:
             "reason": reason,
         }
         self.trade_history.append(trade)
-        self.trade_history = self.trade_history[-50:]
+        self.trade_history = self.trade_history[-1000:]
         self.balance += net_pnl
         if self.balance > self.peak_balance:
             self.peak_balance = self.balance
         self.position = None
+        # 平仓信号也进 signal_log + 落盘(修复此前合约前端看不到平仓历史的 bug)
+        close_signal = {
+            "type": "CLOSE",
+            "direction": pos["direction"],
+            "price": round(float(exit_price), 2),
+            "ts": int(ts),
+            "roc5": None,
+            "roc20": None,
+            "reason": reason,
+            "pnl": round(net_pnl, 4),
+            "entry_price": pos["entry_price"],
+            "exit_price": round(float(exit_price), 2),
+            "held_bars": self.bar_counter - pos["entry_bar"],
+            "received_at": now(),
+        }
+        self.signal_log.append(close_signal)
+        self.signal_log = self.signal_log[-1000:]
+        self._append_signal_jsonl(close_signal)
+        self._save_state()                    # 持仓状态落盘
         return trade
 
     def _check_exit_conditions(self, price, cur_roc5):
@@ -385,26 +595,94 @@ class LiveTrader:
             "entry_time": pos["entry_time"],
         }
 
+    def _current_atr(self, period=ATR_PERIOD):
+        """计算最近一根K线的 ATR (锁外调用, 内部仅短暂快照 bars)"""
+        with self.lock:
+            bars = list(self.bars)
+        if len(bars) < period + 2:
+            return 0.0
+        highs = np.array([b["h"] for b in bars])
+        lows = np.array([b["l"] for b in bars])
+        closes = np.array([b["c"] for b in bars])
+        atr = calc_atr(highs, lows, closes, period)
+        v = atr[-1]
+        return float(v) if not np.isnan(v) else 0.0
+
+    def manual_order(self, side, exec_price, usdt, leverage, ts):
+        """手动下单(模拟): 空仓→开仓(自定义杠杆+ATR止损); 反方向→平仓. 返回 {"ok", "message"}"""
+        direction = "long" if side == "buy" else "short"
+        cn_dir = "多" if direction == "long" else "空"
+        cur_atr = self._current_atr()          # 锁外算 ATR, 避免嵌套锁
+        with self.lock:
+            if self.position is not None:
+                pos = self.position
+                if pos["direction"] == direction:
+                    return {"ok": False, "message": f"已有同方向持仓(做{cn_dir}), 请先平仓或反向下单"}
+                trade = self._close_position(exec_price, "manual", int(ts))
+                return {"ok": True, "message": f"平仓成功(做{cn_dir}平), 成交 {exec_price:.2f}, 盈亏 {trade['pnl']:+.2f}U"}
+            # 空仓 → 开仓
+            if direction == "long":
+                sl_price = exec_price - SL_ATR_MULT * cur_atr
+                tp_price = exec_price + TP_ATR_MULT * cur_atr
+            else:
+                sl_price = exec_price + SL_ATR_MULT * cur_atr
+                tp_price = exec_price - TP_ATR_MULT * cur_atr
+            self.position = {
+                "direction": direction,
+                "entry_price": round(float(exec_price), 2),
+                "size_usdt": round(float(usdt), 2),
+                "fraction": 0,
+                "entry_time": int(ts),
+                "entry_bar": self.bar_counter,
+                "entry_roc5": 0,
+                "entry_roc20": 0,
+                "entry_atr": round(float(cur_atr), 2),
+                "sl_price": round(float(sl_price), 2),
+                "tp_price": round(float(tp_price), 2),
+                "leverage": int(leverage),
+                "manual": True,
+            }
+            signal = {
+                "type": "BUY" if direction == "long" else "SELL",
+                "direction": direction,
+                "price": round(float(exec_price), 2),
+                "ts": int(ts),
+                "roc5": None, "roc20": None,
+                "reason": "manual", "reason_desc": f"手动开仓(做{cn_dir}, 杠杆{int(leverage)}x)",
+                "manual": True,
+                "received_at": now(),
+            }
+            self.signal_log.append(signal)
+            self.signal_log = self.signal_log[-1000:]
+            self._append_signal_jsonl(signal)
+            self._save_state()
+            return {"ok": True, "message": f"开仓成功(做{cn_dir}), 成交 {exec_price:.2f}, 名义 {usdt:.0f}U @ {int(leverage)}x, 止损 {sl_price:.2f}"}
+
     # ---- 信号检测 + 持仓管理 ----
     def check_signal(self, dry_run=False):
         """基于最新收盘K线: 先检查出场, 再检查入场。返回事件列表 (入场/出场)
 
         dry_run=True 时仅更新指标/信号状态, 不开仓/平仓 (用于启动时)
         """
-        closes, vols, roc5, roc20, vol_ma, atr = self.compute_indicators()
+        closes, vols, roc5, roc20, roc50, vol_ma, trend_ma, atr, atr_state = self.compute_indicators()
         i = len(closes) - 1
-        if i < max(ROC_MEDIUM, VOL_MA_PERIOD, ATR_PERIOD) + 2:
+        if i < max(ROC_MEDIUM, VOL_MA_PERIOD, ATR_PERIOD, ROC_LONG, TREND_MA_PERIOD, ATR_STATE_PERIOD) + 2:
             return []
 
         cur_roc5 = roc5[i]
         cur_roc20 = roc20[i]
+        cur_roc50 = roc50[i]
         cur_vol = vols[i]
         cur_vol_ma = vol_ma[i]
+        cur_trend_ma = trend_ma[i]
         cur_atr = atr[i]
+        cur_atr_state = atr_state[i]
         price = closes[i]
         ts = self.bars[i]["t"]
 
-        if np.isnan(cur_roc5) or np.isnan(cur_roc20) or np.isnan(cur_vol_ma) or np.isnan(cur_atr):
+        if np.isnan(cur_roc5) or np.isnan(cur_roc20) or np.isnan(cur_roc50) \
+           or np.isnan(cur_vol_ma) or np.isnan(cur_trend_ma) \
+           or np.isnan(cur_atr) or np.isnan(cur_atr_state):
             return []
 
         # 更新指标状态
@@ -412,22 +690,43 @@ class LiveTrader:
             "price": round(float(price), 2),
             "roc5": round(float(cur_roc5), 4),
             "roc20": round(float(cur_roc20), 4),
+            "roc50": round(float(cur_roc50), 4),
+            "trend_ma": round(float(cur_trend_ma), 2),
             "volume": round(float(cur_vol), 2),
             "vol_ma": round(float(cur_vol_ma), 2),
             "vol_ratio": round(float(cur_vol / cur_vol_ma), 2) if cur_vol_ma > 0 else 0,
             "atr": round(float(cur_atr), 2),
+            "atr_state": round(float(cur_atr_state), 2),
             "ts": int(ts),
         }
 
-        # 入场条件检查 (用于前端条件面板)
+        # 入场条件检查 (五维共振: 双ROC加速 + 量能 + 2天趋势 + 2天动量 + 波动放大)
         vol_ok = cur_vol > cur_vol_ma
-        long_roc = cur_roc5 > 0 and cur_roc20 > 0 and cur_roc5 > cur_roc20
-        short_roc = cur_roc5 < 0 and cur_roc20 < 0 and cur_roc5 < cur_roc20
+        atr_expanding = cur_atr > cur_atr_state
+        long_roc = (cur_roc5 > 0 and cur_roc20 > 0 and cur_roc5 > cur_roc20
+                    and price > cur_trend_ma and cur_roc50 > 0)
+        short_roc = (cur_roc5 < 0 and cur_roc20 < 0 and cur_roc5 < cur_roc20
+                     and price < cur_trend_ma and cur_roc50 < 0)
 
         self.signal_readiness = {
             "vol_confirmed": bool(vol_ok),
-            "long_ready": bool(vol_ok and long_roc),
-            "short_ready": bool(vol_ok and short_roc),
+            "atr_expanding": bool(atr_expanding),
+            "trend_up": bool(price > cur_trend_ma),
+            "trend_down": bool(price < cur_trend_ma),
+            # 做多逐维度 (供前端逐条打勾)
+            "long_roc5": bool(cur_roc5 > 0),
+            "long_roc20": bool(cur_roc20 > 0),
+            "long_acc": bool(cur_roc5 > cur_roc20),
+            "long_trend": bool(price > cur_trend_ma),
+            "long_roc50": bool(cur_roc50 > 0),
+            # 做空逐维度
+            "short_roc5": bool(cur_roc5 < 0),
+            "short_roc20": bool(cur_roc20 < 0),
+            "short_acc": bool(cur_roc5 < cur_roc20),
+            "short_trend": bool(price < cur_trend_ma),
+            "short_roc50": bool(cur_roc50 < 0),
+            "long_ready": bool(vol_ok and atr_expanding and long_roc),
+            "short_ready": bool(vol_ok and atr_expanding and short_roc),
             "neutral": bool(not long_roc and not short_roc),
         }
 
@@ -445,8 +744,8 @@ class LiveTrader:
                     events.append({"type": "CLOSE", "trade": trade})
                     self.current_signal = None
 
-        # ---- 2. 无持仓 → 检查入场信号 ----
-        if self.position is None and vol_ok:
+        # ---- 2. 无持仓 → 检查入场信号 (五维共振) ----
+        if self.position is None and vol_ok and atr_expanding:
             signal = None
             if long_roc:
                 signal = {"type": "BUY", "direction": "long", "price": round(float(price), 2),
@@ -465,8 +764,10 @@ class LiveTrader:
                 signal["sl_price"] = self.position["sl_price"]
                 signal["tp_price"] = self.position["tp_price"]
                 signal["size_usdt"] = self.position["size_usdt"]
+                signal["received_at"] = now()           # 本地触发时间, 排查延迟用
                 self.signal_log.append(signal)
-                self.signal_log = self.signal_log[-50:]
+                self.signal_log = self.signal_log[-1000:]   # 50 → 1000
+                self._append_signal_jsonl(signal)            # 落盘 JSONL
                 events.append({"type": "OPEN", "signal": signal})
 
         return events
@@ -484,6 +785,9 @@ class LiveTrader:
                 "l": float(k["l"]),   "c": float(k["c"]), "v": float(k["v"]),
             }
 
+            # Phase 1: 锁内只更新 bars (不调用 check_signal, 避免与 compute_indicators 死锁)
+            need_signal_check = False
+            closed_bar_copy = None
             with self.lock:
                 if is_closed:
                     if self.bars and self.bars[-1]["t"] == bar["t"]:
@@ -493,23 +797,27 @@ class LiveTrader:
                         if len(self.bars) > HISTORY_BARS:
                             self.bars = self.bars[-HISTORY_BARS:]
                     self.bar_counter += 1
-
-                    # 收盘K线 → 完整信号检测 + 持仓出场检查
-                    events = self.check_signal()
-                    self._print_status(bar)
-                    for ev in events:
-                        if ev["type"] == "OPEN":
-                            self._print_signal(ev["signal"])
-                        elif ev["type"] == "CLOSE":
-                            self._print_close(ev["trade"])
+                    closed_bar_copy = dict(bar)
+                    need_signal_check = True
                 else:
-                    # 未收盘K线 → 更新最新一根 + 实时 SL/TP 检查
+                    # 未收盘K线 → 更新最新一根
                     if self.bars and self.bars[-1]["t"] == bar["t"]:
                         self.bars[-1] = bar
                     else:
                         self.bars.append(bar)
-                    # 实时价格触及 SL/TP → 立即平仓 (不等收盘)
-                    self._check_realtime_sl_tp(bar["c"], bar["t"])
+
+            # Phase 2: 锁外执行信号检测 + 打印 (避免 threading.Lock 不可重入死锁)
+            if need_signal_check:
+                events = self.check_signal()
+                self._print_status(closed_bar_copy)
+                for ev in events:
+                    if ev["type"] == "OPEN":
+                        self._print_signal(ev["signal"])
+                    elif ev["type"] == "CLOSE":
+                        self._print_close(ev["trade"])
+            else:
+                # 实时价格触及 SL/TP → 立即平仓 (不等收盘), 锁外执行
+                self._check_realtime_sl_tp(bar["c"], bar["t"])
         except Exception as e:
             print(f"  ⚠️ [{now()}] K线解析错误: {e}")
 
@@ -660,15 +968,161 @@ class LiveTrader:
     def connect_ticker(self):
         self._ws_connect(WS_TICKER_URL, self.on_ticker_message, "Ticker")
 
+    def connect_aggtrade(self):
+        self._ws_connect(WS_AGGTRADE_URL, self.on_aggtrade_message, "Aggtrade")
+
+    def on_aggtrade_message(self, ws, msg):
+        """大单成交回调: 筛选 ≥ LARGE_ORDER_USDT 的大单, 累加到 deque (高频, 轻量, 不持锁)"""
+        try:
+            d = json.loads(msg)
+            if "p" not in d or "q" not in d:
+                return
+            price = float(d["p"]); qty = float(d["q"])
+            usdt = price * qty
+            if usdt >= LARGE_ORDER_USDT:
+                side = "sell" if d.get("m") else "buy"   # m=true=买方是maker→卖方主动=sell
+                order = {"ts": int(d.get("T", time.time()*1000)),
+                         "price": round(price, 2),
+                         "usdt": round(usdt, 0),
+                         "side": side}
+                self.large_orders.append(order)
+                self.flow_window.append(order)
+        except Exception:
+            pass
+
+    def _calc_flow_stats(self):
+        """计算各窗口大单净买卖额 + 买卖比 (broadcast 时调用)"""
+        now_ms = time.time() * 1000
+        stats = []
+        for mins in FLOW_WINDOWS:
+            cutoff = now_ms - mins * 60 * 1000
+            buys = sum(o["usdt"] for o in self.flow_window if o["ts"] >= cutoff and o["side"] == "buy")
+            sells = sum(o["usdt"] for o in self.flow_window if o["ts"] >= cutoff and o["side"] == "sell")
+            stats.append({"window": mins, "buy": round(buys, 0), "sell": round(sells, 0),
+                          "net": round(buys - sells, 0),
+                          "ratio": round(buys / sells, 2) if sells > 0 else 0})
+        return stats
+
+    def _poll_kline_rest(self):
+        """REST 轮询 K 线 (fstream WS 被阻断, fapi REST 正常, 作为主数据源)
+
+        ⚠️ 死锁防御: check_signal() → compute_indicators() 会再次获取 self.lock,
+        threading.Lock 不可重入 → 必须在锁外调用 check_signal/_print_status/_print_signal。
+        """
+        while self.running:
+            try:
+                data = self._rest_get(f"{REST_KLINE_URL}?symbol=ETHUSDT&interval=1h&limit=2")
+                if not data:
+                    time.sleep(5); continue
+
+                # Phase 1: 锁内只更新 bars (不调用 check_signal, 避免死锁)
+                closed_bar_copy = None   # 收盘K线副本, 供锁外信号检测用
+                pending_new_bar = None   # 新K线(暂不追加, 等信号检测后再追加)
+                need_signal_check = False
+                with self.lock:
+                    for k in data:
+                        bar = {"t": int(k[0]), "o": float(k[1]), "h": float(k[2]),
+                               "l": float(k[3]), "c": float(k[4]), "v": float(k[5])}
+                        if not self.bars:
+                            self.bars.append(bar)
+                        elif bar["t"] > self.bars[-1]["t"]:
+                            # 新K线出现 → 前一根(self.bars[-1])刚收盘
+                            # 暂不追加新K线, 让 check_signal 用收盘的那根计算
+                            closed_bar_copy = dict(self.bars[-1])
+                            pending_new_bar = bar
+                            need_signal_check = True
+                            self.bar_counter += 1
+                        elif bar["t"] == self.bars[-1]["t"]:
+                            # 当前K线更新
+                            self.bars[-1] = bar
+
+                # Phase 2: 锁外信号检测 (check_signal 内部自己加锁, 不死锁)
+                if need_signal_check:
+                    # self.bars[-1] 此时仍是收盘K线 (新K线未追加), check_signal 用它计算
+                    events = self.check_signal()
+                    self._print_status(closed_bar_copy)
+                    for ev in events:
+                        if ev["type"] == "OPEN":
+                            self._print_signal(ev["signal"])
+                        elif ev["type"] == "CLOSE":
+                            self._print_close(ev["trade"])
+                    # Phase 3: 信号检测后追加新K线
+                    if pending_new_bar is not None:
+                        with self.lock:
+                            self.bars.append(pending_new_bar)
+                            if len(self.bars) > HISTORY_BARS:
+                                self.bars = self.bars[-HISTORY_BARS:]
+                else:
+                    # 当前K线更新 → 实时 SL/TP 检查 (锁外)
+                    with self.lock:
+                        cur_c = self.bars[-1]["c"] if self.bars else 0
+                        cur_t = self.bars[-1]["t"] if self.bars else 0
+                    self._check_realtime_sl_tp(cur_c, cur_t)
+            except Exception as e:
+                print(f"  ⚠️ [{now()}] REST K线轮询错误: {e}")
+            time.sleep(5)
+
+    def _poll_ticker_rest(self):
+        """REST 轮询最新价格 (替代 fstream ticker WS)"""
+        while self.running:
+            try:
+                data = self._rest_get(REST_TICKER_URL)
+                if data and "price" in data:
+                    self.last_price = float(data["price"])
+            except Exception:
+                pass
+            time.sleep(2)
+
+    def _poll_aggtrade_rest(self):
+        """REST 轮询大单 (替代 fstream aggTrade WS, 5s 一次)"""
+        last_id = 0
+        while self.running:
+            try:
+                data = self._rest_get("https://fapi.binance.com/fapi/v1/aggTrades?symbol=ETHUSDT&limit=100")
+                if data:
+                    for t in data:
+                        if t.get("a", 0) <= last_id:
+                            continue
+                        price = float(t["p"]); qty = float(t["q"])
+                        usdt = price * qty
+                        if usdt >= LARGE_ORDER_USDT:
+                            side = "sell" if t.get("m") else "buy"
+                            order = {"ts": int(t.get("T", time.time()*1000)),
+                                     "price": round(price, 2), "usdt": round(usdt, 0), "side": side}
+                            self.large_orders.append(order)
+                            self.flow_window.append(order)
+                    last_id = data[-1].get("a", last_id)
+            except Exception:
+                pass
+            time.sleep(5)
+
+    def _poll_long_short_ratio(self):
+        """合约多空比轮询 (币安无 WS, 每 5 分钟 REST; 接口受限则降级跳过)"""
+        while self.running:
+            try:
+                top = self._rest_get(REST_LSR_TOP_URL)
+                acct = self._rest_get(REST_LSR_ACCT_URL)
+                if top and acct and len(top) and len(acct):
+                    t, a = top[-1], acct[-1]
+                    self.long_short_ratio = {
+                        "top_ratio": float(t["longShortRatio"]),
+                        "top_long": float(t["longAccount"]), "top_short": float(t["shortAccount"]),
+                        "acct_ratio": float(a["longShortRatio"]),
+                        "acct_long": float(a["longAccount"]), "acct_short": float(a["shortAccount"]),
+                        "ts": int(t["timestamp"]),
+                    }
+            except Exception:
+                pass
+            time.sleep(LSR_POLL_INTERVAL)
+
     def start(self):
         print(f"{'='*65}")
-        print(f"  🎯 ETH 双ROC动量策略 — 合约({MARKET_NAME})实时模拟交易")
-        print(f"  策略: ROC({ROC_SHORT})/ROC({ROC_MEDIUM}) + VolMA({VOL_MA_PERIOD}) + ATR({ATR_PERIOD})")
-        print(f"  做多: ROC{ROC_SHORT}>0 & ROC{ROC_MEDIUM}>0 & ROC{ROC_SHORT}>ROC{ROC_MEDIUM} & 放量")
-        print(f"  做空: ROC{ROC_SHORT}<0 & ROC{ROC_MEDIUM}<0 & ROC{ROC_SHORT}<ROC{ROC_MEDIUM} & 放量")
-        print(f"  本金: {CAPITAL}U | 杠杆: {LEVERAGE}x | 仓位: {FRACTION_BASE*100:.0f}%")
-        print(f"  止损: {SL_ATR_MULT}×ATR | 止盈: {TP_ATR_MULT}×ATR | 动量阈值: ±{MOMENTUM_DEATH_THRESH}")
-        print(f"  最大持仓: {MAX_HOLD_BARS}根K线")
+        print(f"  🎯 ETH 双ROC共振策略 — 合约({MARKET_NAME})实时模拟交易")
+        print(f"  策略: ROC({ROC_SHORT})/ROC({ROC_MEDIUM})/ROC({ROC_LONG}) + VolMA({VOL_MA_PERIOD}) + MA({TREND_MA_PERIOD}) + ATR({ATR_PERIOD})")
+        print(f"  做多: ROC{ROC_SHORT}>0 & ROC{ROC_MEDIUM}>0 & ROC{ROC_SHORT}>ROC{ROC_MEDIUM} & 放量 & 价>MA{TREND_MA_PERIOD} & ROC{ROC_LONG}>0 & ATR放大")
+        print(f"  做空: 全镜像")
+        print(f"  本金: {CAPITAL}U | 杠杆: {LEVERAGE}x | 仓位: {FRACTION_BASE*100:.0f}% (有效{LEVERAGE*FRACTION_BASE:.1f}x)")
+        print(f"  止损: {SL_ATR_MULT}×ATR | 止盈: 动量衰竭(ROC{ROC_SHORT}穿零) | 超时: {MAX_HOLD_BARS}根")
         print(f"  数据源: {MARKET_NAME} | {WS_KLINE_URL}")
         print(f"  面板  : http://127.0.0.1:{SERVER_PORT} (合约)")
         print(f"{'='*65}")
@@ -680,9 +1134,17 @@ class LiveTrader:
         if self.bars:
             self._print_status(self.bars[-1])
 
-        # 启动 WS 线程
+        # 启动数据线程
+        # ⚠️ fstream.binance.com WS 被阻断(代理/直连均超时), 改用 fapi REST 轮询作为主数据源
+        # WS 线程保留持续重连(fstream 恢复后自动接管低延迟模式); REST 轮询兜底保证数据更新
         threading.Thread(target=self.connect_kline, daemon=True, name="kline-ws").start()
         threading.Thread(target=self.connect_ticker, daemon=True, name="ticker-ws").start()
+        threading.Thread(target=self.connect_aggtrade, daemon=True, name="aggtrade-ws").start()
+        threading.Thread(target=self._poll_kline_rest, daemon=True, name="kline-rest").start()
+        threading.Thread(target=self._poll_ticker_rest, daemon=True, name="ticker-rest").start()
+        threading.Thread(target=self._poll_aggtrade_rest, daemon=True, name="aggtrade-rest").start()
+        threading.Thread(target=self._poll_long_short_ratio, daemon=True, name="lsr-poll").start()
+        print(f"  🐋 大资金流向: REST轮询(fstream WS阻断) + 多空比轮询已启动 (≥{LARGE_ORDER_USDT/10000:.0f}万U)")
 
         # 定时打印实时价格
         threading.Thread(target=self._price_reporter, daemon=True, name="price-reporter").start()
@@ -712,41 +1174,73 @@ class LiveTrader:
         vols = np.array([b["v"] for b in bars])
         roc5 = calc_roc(closes, ROC_SHORT)
         roc20 = calc_roc(closes, ROC_MEDIUM)
+        roc50_arr = calc_roc(closes, ROC_LONG)
         vol_ma = calc_ma(vols, VOL_MA_PERIOD)
+        trend_ma_arr = calc_ma(closes, TREND_MA_PERIOD)
         atr_arr = calc_atr(highs, lows, closes, ATR_PERIOD)
+        atr_state_arr = calc_ma(atr_arr, ATR_STATE_PERIOD)
 
         klines = [[b["t"], b["o"], b["h"], b["l"], b["c"], b["v"]] for b in bars]
 
         def series(arr):
+            # 返回与 bars 等长的数组, NaN 位置用 None(null) 填充,
+            # 使 ECharts category 轴按索引对齐 (否则过滤NaN后数组变短,
+            # 曲线会整体左移 period 位, 末端缺失 → ROC(20)看似只到前一天的错觉)
             out = []
-            for i, v in enumerate(arr):
-                if not np.isnan(v):
-                    out.append([int(bars[i]["t"]), round(float(v), 4)])
+            for v in arr:
+                if np.isnan(v):
+                    out.append(None)
+                else:
+                    out.append(round(float(v), 4))
             return out
 
         # 实时指标: 用最新 bar 重新计算, 不依赖 K线收盘时的缓存
-        if len(closes) and not np.isnan(roc5[-1]) and not np.isnan(vol_ma[-1]):
+        # (50期指标 warmup 内为 NaN, 此时回退缓存, 避免 JSON 序列化 500)
+        if len(closes) and not np.isnan(roc5[-1]) and not np.isnan(vol_ma[-1]) \
+                and not np.isnan(roc50_arr[-1]) and not np.isnan(trend_ma_arr[-1]):
             _price = round(float(closes[-1]), 2)
             _vol, _volma = float(vols[-1]), float(vol_ma[-1])
             _roc5, _roc20 = float(roc5[-1]), float(roc20[-1])
+            _roc50 = float(roc50_arr[-1])
+            _trend_ma = float(trend_ma_arr[-1])
             _atr = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0
+            _atr_state = float(atr_state_arr[-1]) if not np.isnan(atr_state_arr[-1]) else 0
             indicator_state = {
                 "price": _price,
                 "roc5": round(_roc5, 4),
                 "roc20": round(_roc20, 4),
+                "roc50": round(_roc50, 4),
+                "trend_ma": round(_trend_ma, 2),
                 "volume": round(_vol, 2),
                 "vol_ma": round(_volma, 2),
                 "vol_ratio": round(_vol / _volma, 2) if _volma > 0 else 0,
                 "atr": round(_atr, 2),
+                "atr_state": round(_atr_state, 2),
                 "ts": int(bars[-1]["t"]),
             }
             vol_ok = _vol > _volma
-            long_roc = _roc5 > 0 and _roc20 > 0 and _roc5 > _roc20
-            short_roc = _roc5 < 0 and _roc20 < 0 and _roc5 < _roc20
+            atr_expanding = _atr > _atr_state
+            long_roc = (_roc5 > 0 and _roc20 > 0 and _roc5 > _roc20
+                        and _price > _trend_ma and _roc50 > 0)
+            short_roc = (_roc5 < 0 and _roc20 < 0 and _roc5 < _roc20
+                         and _price < _trend_ma and _roc50 < 0)
             signal_readiness = {
                 "vol_confirmed": bool(vol_ok),
-                "long_ready": bool(vol_ok and long_roc),
-                "short_ready": bool(vol_ok and short_roc),
+                "atr_expanding": bool(atr_expanding),
+                "trend_up": bool(_price > _trend_ma),
+                "trend_down": bool(_price < _trend_ma),
+                "long_roc5": bool(_roc5 > 0),
+                "long_roc20": bool(_roc20 > 0),
+                "long_acc": bool(_roc5 > _roc20),
+                "long_trend": bool(_price > _trend_ma),
+                "long_roc50": bool(_roc50 > 0),
+                "short_roc5": bool(_roc5 < 0),
+                "short_roc20": bool(_roc20 < 0),
+                "short_acc": bool(_roc5 < _roc20),
+                "short_trend": bool(_price < _trend_ma),
+                "short_roc50": bool(_roc50 < 0),
+                "long_ready": bool(vol_ok and atr_expanding and long_roc),
+                "short_ready": bool(vol_ok and atr_expanding and short_roc),
                 "neutral": bool(not long_roc and not short_roc),
             }
         else:
@@ -758,17 +1252,31 @@ class LiveTrader:
         drawdown = (self.peak_balance - self.balance) / self.peak_balance * 100 if self.peak_balance > 0 else 0
         return_pct = (self.balance - CAPITAL) / CAPITAL * 100
 
+        # 趋势判断 + 支撑/突破位 + 布林带 (实时计算, 前端每次轮询拿到最新值)
+        trend_state = analyze_trend(closes) if len(closes) >= 60 else \
+            {"trend": "unknown", "label": "--", "ma_fast": None, "ma_slow": None,
+             "spread_pct": None, "slope_pct": None}
+        supports = find_supports(bars, closes)
+        resistances = find_resistances(bars, closes)
+        boll_upper, boll_mid, boll_lower = calc_boll(closes)
+
         return {
             "klines": klines,
             "roc5": series(roc5),
             "roc20": series(roc20),
             "vol_ma": series(vol_ma),
             "volma20": series(calc_ma(vols, 20)),
+            "boll_upper": series(boll_upper),
+            "boll_mid": series(boll_mid),
+            "boll_lower": series(boll_lower),
             "signals": signals,
             "last_price": self.last_price or (round(float(closes[-1]), 2) if len(closes) else 0),
             "last_ts": int(bars[-1]["t"]) if bars else 0,
             "indicator_state": indicator_state,
             "signal_readiness": signal_readiness,
+            "trend_state": trend_state,
+            "supports": supports,
+            "resistances": resistances,
             "position": position_view,
             "balance": round(self.balance, 2),
             "peak_balance": round(self.peak_balance, 2),
@@ -784,6 +1292,9 @@ class LiveTrader:
                 "atr_period": ATR_PERIOD, "sl_atr_mult": SL_ATR_MULT,
                 "tp_atr_mult": TP_ATR_MULT, "max_hold_bars": MAX_HOLD_BARS,
             },
+            "large_orders": list(self.large_orders)[-30:],
+            "flow_stats": self._calc_flow_stats(),
+            "long_short_ratio": self.long_short_ratio,
             "server_time": int(time.time() * 1000),
         }
 
@@ -799,20 +1310,25 @@ HTML_PAGE = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ETH v12 合约实时交易信号面板</title>
+<title>ETH 五维共振策略 · 合约 20x 实时信号面板</title>
 <script src="/static/echarts.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;overflow:hidden}
+.app-shell{display:flex;height:100vh}
+.app-sidebar{width:190px;flex-shrink:0;background:#161b22;border-right:2px solid #30363d;display:flex;flex-direction:column;padding:16px 0;overflow-y:auto}
+.app-sidebar .logo{font-size:15px;font-weight:700;color:#58a6ff;padding:0 18px 14px;border-bottom:1px solid #30363d;white-space:nowrap}
+.app-sidebar .nav-group{margin-top:14px}
+.app-sidebar .group-title{font-size:11px;color:#8b949e;padding:0 18px;margin-bottom:4px;letter-spacing:.5px}
+.app-sidebar a{display:block;padding:8px 18px;color:#8b949e;text-decoration:none;font-size:13px;border-left:3px solid transparent;white-space:nowrap}
+.app-sidebar a:hover{color:#f0f6fc;background:#21262d}
+.app-sidebar a.active{color:#58a6ff;background:#1f6feb22;border-left-color:#1f6feb}
+.app-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
 .header{background:#161b22;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #30363d;gap:12px}
 .header h1{font-size:18px;color:#58a6ff}
-.header .nav{display:flex;gap:8px;align-items:center}
-.header .nav a{color:#8b949e;font-size:13px;text-decoration:none;padding:4px 10px;border-radius:4px;border:1px solid #30363d}
-.header .nav a.active{color:#f7931a;border-color:#f7931a;background:#f7931a22}
-.header .nav a:hover{color:#58a6ff;border-color:#58a6ff}
 .price-display{font-size:28px;font-weight:bold;color:#f0f6fc}
 .price-display .change{font-size:14px;margin-left:10px}
-.layout{display:flex;height:calc(100vh - 50px)}
+.layout{display:flex;flex:1;min-height:0}
 .chart-area{flex:1;min-width:0}
 #kline-chart{width:100%;height:60%}
 #roc-chart{width:100%;height:40%}
@@ -822,14 +1338,36 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d
 .indicator-row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}
 .indicator-row .label{color:#8b949e}
 .indicator-row .value{font-weight:bold}
+.trend-up{color:#3fb950;font-weight:bold}
+.trend-down{color:#f85149;font-weight:bold}
+.trend-side{color:#d29922;font-weight:bold}
 .condition{display:flex;align-items:center;padding:6px 10px;margin:4px 0;border-radius:4px;font-size:12px}
 .condition.met{background:#1a3a1a;color:#3fb950}
 .condition.not-met{background:#3a1a1a;color:#f85149}
 .condition .icon{margin-right:8px;font-size:16px}
+.cond-group{border-radius:4px;padding:4px 8px;margin:8px 0;background:#0d1117}
+.cond-group.long{border:1px solid #1f4a2a}
+.cond-group.short{border:1px solid #4a1f1f}
+.cond-group.ready{border-color:#3fb950}
+.cond-group-title{font-size:12px;font-weight:bold;color:#8b949e;margin-bottom:2px}
+.cond-group .condition{padding:4px 8px;margin:3px 0}
 .signal-alert{padding:12px;border-radius:6px;margin:8px 0;font-weight:bold;font-size:14px;text-align:center}
 .signal-alert.buy{background:#1a3a1a;border:2px solid #3fb950;color:#3fb950}
 .signal-alert.sell{background:#3a1a1a;border:2px solid #f85149;color:#f85149}
 .signal-alert.neutral{background:#1a1a2e;border:2px solid #30363d;color:#8b949e}
+.order-form{display:flex;flex-direction:column;gap:8px}
+.order-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.o-label{font-size:12px;color:#8b949e;white-space:nowrap}
+.o-side{display:flex;gap:6px}
+.o-btn{padding:4px 12px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#8b949e;cursor:pointer;font-size:12px}
+.o-btn.buy.active{background:#238636;color:#fff;border-color:#238636}
+.o-btn.sell.active{background:#da3633;color:#fff;border-color:#da3633}
+.order-form select,.order-form input[type=number]{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:4px 6px;font-size:12px;width:110px}
+.o-submit{width:100%;padding:8px;border:none;border-radius:6px;background:#2f81f7;color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+.o-submit:hover{background:#388bfd}
+.o-msg{margin-top:6px;font-size:12px;color:#8b949e;word-break:break-all}
+.o-msg.ok{color:#3fb950}
+.o-msg.err{color:#f85149}
 .signal-list{max-height:250px;overflow-y:auto}
 .signal-item{display:flex;align-items:center;padding:6px 8px;margin:3px 0;border-radius:3px;font-size:12px;background:#21262d}
 .signal-item.buy-signal{border-left:3px solid #3fb950}
@@ -837,6 +1375,11 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d
 .signal-item .dir{font-weight:bold;width:35px}
 .signal-item .price{flex:1;text-align:right}
 .signal-item .time{color:#8b949e;font-size:11px;margin-left:8px}
+.signal-item.close-signal{border-left:3px solid #f0883e}
+.signal-item .t-pnl{font-weight:bold}
+.signal-item .t-pnl.pos{color:#3fb950}
+.signal-item .t-pnl.neg{color:#f85149}
+.signal-item .t-reason{color:#8b949e;font-size:11px}
 .param-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:12px}
 .param-item{background:#21262d;padding:5px 8px;border-radius:3px}
 .param-item .p-label{color:#8b949e}
@@ -870,14 +1413,32 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d
 </head>
 <body>
 
-<div class="header">
-  <h1><span class="live-dot"></span>ETH v12 双ROC动量策略 — 合约实时信号</h1>
-  <div class="nav">
-    <a href="http://127.0.0.1:8080">现货</a>
-    <a href="http://127.0.0.1:8081" class="active">合约</a>
+<div class="app-shell">
+  <div class="app-sidebar">
+    <div class="logo">📈 ETH 量化平台</div>
+    <nav class="nav-group">
+      <div class="group-title">导航</div>
+      <a href="http://127.0.0.1:8082/info">🏠 信息</a>
+      <a href="http://127.0.0.1:8082/alpha">🧪 Alpha回测</a>
+      <a href="http://127.0.0.1:8082/reports">📊 策略及回测</a>
+      <a href="http://127.0.0.1:8082/testnet">🔌 Testnet</a>
+    </nav>
+    <nav class="nav-group">
+      <div class="group-title">现货 · 8080</div>
+      <a href="http://127.0.0.1:8080/">📊 信号</a>
+      <a href="http://127.0.0.1:8080/flow">🐋 大资金</a>
+    </nav>
+    <nav class="nav-group">
+      <div class="group-title">合约 · 8081</div>
+      <a href="/" class="active">📊 信号</a>
+      <a href="/flow">🐋 大资金</a>
+    </nav>
   </div>
-  <div class="price-display" id="price-display">--</div>
-</div>
+  <div class="app-main">
+    <div class="header">
+      <h1><span class="live-dot"></span>ETH 五维共振策略 · 合约 20x</h1>
+      <div class="price-display" id="price-display">--</div>
+    </div>
 
 <div class="layout">
   <div class="chart-area">
@@ -911,29 +1472,80 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d
       <div class="signal-alert neutral" id="signal-alert">⚪ 等待信号...</div>
     </div>
 
-    <!-- 入场条件 -->
+    <!-- 手动下单 -->
+    <div class="section">
+      <h3>🖐 手动下单</h3>
+      <div class="order-form">
+        <div class="order-row"><span class="o-label">方向</span>
+          <div class="o-side">
+            <button type="button" class="o-btn buy active" id="obuy">买入多</button>
+            <button type="button" class="o-btn sell" id="osell">卖出空</button>
+          </div>
+        </div>
+        <div class="order-row"><span class="o-label">类型</span>
+          <select id="otype"><option value="market">市价单</option><option value="limit">限价单</option></select>
+        </div>
+        <div class="order-row" id="price-row" style="display:none"><span class="o-label">限价</span>
+          <input type="number" id="oprice" step="0.01" min="0" placeholder="0.00">
+        </div>
+        <div class="order-row"><span class="o-label">金额USDT</span>
+          <input type="number" id="ousdt" step="10" min="10" value="45">
+        </div>
+        <div class="order-row"><span class="o-label">杠杆</span>
+          <select id="olev">
+            <option value="1">1x</option><option value="2">2x</option>
+            <option value="3">3x</option><option value="5">5x</option>
+            <option value="10">10x</option><option value="20" selected>20x</option>
+          </select>
+        </div>
+        <button type="button" class="o-submit" id="osubmit">🚀 下单</button>
+        <div class="o-msg" id="omsg"></div>
+      </div>
+    </div>
+
+    <!-- 入场条件 (五维共振逐条) -->
     <div class="section">
       <h3>📋 入场条件检查</h3>
       <div class="condition not-met" id="cond-vol">
-        <span class="icon">⬜</span> 成交量 > VolMA(20)
+        <span class="icon">⬜</span> 放量: 成交量 > VolMA(20)
       </div>
-      <div class="condition not-met" id="cond-long">
-        <span class="icon">⬜</span> ROC(8)>0 & ROC(20)>0 & ROC(8)>ROC(20)
+      <div class="condition not-met" id="cond-atr">
+        <span class="icon">⬜</span> 波动放大: ATR(14) > ATR均值(50)
       </div>
-      <div class="condition not-met" id="cond-short">
-        <span class="icon">⬜</span> ROC(8)<0 & ROC(20)<0 & ROC(8)<ROC(20)
+      <div class="cond-group long" id="cond-long-group">
+        <div class="cond-group-title">🟢 做多共振 (0/5)</div>
+        <div class="condition not-met" id="cond-l-roc5"><span class="icon">⬜</span> ROC(8) &gt; 0</div>
+        <div class="condition not-met" id="cond-l-roc20"><span class="icon">⬜</span> ROC(20) &gt; 0</div>
+        <div class="condition not-met" id="cond-l-acc"><span class="icon">⬜</span> 加速: ROC(8) &gt; ROC(20)</div>
+        <div class="condition not-met" id="cond-l-trend"><span class="icon">⬜</span> 价格 &gt; MA(50)</div>
+        <div class="condition not-met" id="cond-l-roc50"><span class="icon">⬜</span> ROC(50) &gt; 0</div>
+      </div>
+      <div class="cond-group short" id="cond-short-group">
+        <div class="cond-group-title">🔴 做空共振 (0/5)</div>
+        <div class="condition not-met" id="cond-s-roc5"><span class="icon">⬜</span> ROC(8) &lt; 0</div>
+        <div class="condition not-met" id="cond-s-roc20"><span class="icon">⬜</span> ROC(20) &lt; 0</div>
+        <div class="condition not-met" id="cond-s-acc"><span class="icon">⬜</span> 加速: ROC(8) &lt; ROC(20)</div>
+        <div class="condition not-met" id="cond-s-trend"><span class="icon">⬜</span> 价格 &lt; MA(50)</div>
+        <div class="condition not-met" id="cond-s-roc50"><span class="icon">⬜</span> ROC(50) &lt; 0</div>
       </div>
     </div>
 
     <!-- 实时指标 -->
     <div class="section">
       <h3>📊 当前指标</h3>
+      <div class="indicator-row"><span class="label">趋势</span><span class="value" id="ind-trend">--</span></div>
+      <div class="indicator-row"><span class="label">支撑位</span><span class="value" id="ind-supports">--</span></div>
+      <div class="indicator-row"><span class="label">突破位</span><span class="value" id="ind-resist">--</span></div>
+      <div class="indicator-row"><span class="label">布林带 上/中/下</span><span class="value" id="ind-boll">--</span></div>
       <div class="indicator-row"><span class="label">ROC(8)</span><span class="value" id="ind-roc5">--</span></div>
       <div class="indicator-row"><span class="label">ROC(20)</span><span class="value" id="ind-roc20">--</span></div>
+      <div class="indicator-row"><span class="label">ROC(50)</span><span class="value" id="ind-roc50">--</span></div>
+      <div class="indicator-row"><span class="label">MA(50)</span><span class="value" id="ind-ma50">--</span></div>
       <div class="indicator-row"><span class="label">成交量</span><span class="value" id="ind-vol">--</span></div>
       <div class="indicator-row"><span class="label">VolMA(20)</span><span class="value" id="ind-volma">--</span></div>
       <div class="indicator-row"><span class="label">量比</span><span class="value" id="ind-volratio">--</span></div>
       <div class="indicator-row"><span class="label">ATR(14)</span><span class="value" id="ind-atr">--</span></div>
+      <div class="indicator-row"><span class="label">ATR均值(50)</span><span class="value" id="ind-atr-state">--</span></div>
     </div>
 
     <!-- 策略参数 -->
@@ -941,12 +1553,12 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d
       <h3>⚙️ 策略参数</h3>
       <div class="param-grid">
         <div class="param-item"><span class="p-label">本金</span><br><span class="p-val" id="p-capital">150U</span></div>
-        <div class="param-item"><span class="p-label">杠杆</span><br><span class="p-val" id="p-leverage">8x</span></div>
-        <div class="param-item"><span class="p-label">仓位</span><br><span class="p-val" id="p-fraction">25%</span></div>
-        <div class="param-item"><span class="p-label">ROC短/中</span><br><span class="p-val" id="p-roc">8/20</span></div>
+        <div class="param-item"><span class="p-label">杠杆</span><br><span class="p-val" id="p-leverage">20x</span></div>
+        <div class="param-item"><span class="p-label">仓位</span><br><span class="p-val" id="p-fraction">20%</span></div>
+        <div class="param-item"><span class="p-label">ROC 8/20/50</span><br><span class="p-val" id="p-roc">8/20/50</span></div>
+        <div class="param-item"><span class="p-label">MA趋势</span><br><span class="p-val" id="p-ma">MA(50)</span></div>
         <div class="param-item"><span class="p-label">止损</span><br><span class="p-val" id="p-sl">1.5×ATR</span></div>
         <div class="param-item"><span class="p-label">止盈</span><br><span class="p-val" id="p-tp">关闭</span></div>
-        <div class="param-item"><span class="p-label">动量阈值</span><br><span class="p-val" id="p-md">穿零</span></div>
         <div class="param-item"><span class="p-label">最大持仓</span><br><span class="p-val" id="p-hold">72根</span></div>
       </div>
     </div>
@@ -962,6 +1574,8 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d
       <h3>📜 最近信号</h3>
       <div class="signal-list" id="signal-list"></div>
     </div>
+  </div>
+</div>
   </div>
 </div>
 
@@ -985,12 +1599,14 @@ function updateCharts(data) {
   const volData = data.klines.map((k, i) => [i, k[5], k[1] <= k[4] ? 1 : -1]);
 
   // 信号标记
-  const buyMarks = [], sellMarks = [];
+  const buyMarks = [], sellMarks = [], closeMarks = [];
   data.signals.forEach(s => {
     const idx = data.klines.findIndex(k => k[0] === s.ts);
     if (idx >= 0) {
       if (s.type === 'BUY') {
         buyMarks.push({coord: [dates[idx], data.klines[idx][3]], value: s.price});
+      } else if (s.type === 'CLOSE') {
+        closeMarks.push({coord: [dates[idx], data.klines[idx][2]], value: s.price});
       } else {
         sellMarks.push({coord: [dates[idx], data.klines[idx][2]], value: s.price});
       }
@@ -998,7 +1614,32 @@ function updateCharts(data) {
   });
 
   // 成交量MA
-  const volMaData = data.volma20.map(v => v[1]);
+  const volMaData = data.volma20;
+
+  // 支撑位 + 突破位标记 (水平虚线 + 价格标签)
+  const suppMarks = (data.supports||[]).map(s => ({
+    yAxis: s.price,
+    label: {formatter: '支撑 ' + s.price, position: 'insideEndTop',
+            color: '#2f81f7', fontSize: 11},
+    lineStyle: {color: '#2f81f7', type: 'dashed', width: 1.5},
+  }));
+  const resMarks = (data.resistances||[]).map(s => ({
+    yAxis: s.price,
+    label: {formatter: '突破 ' + s.price, position: 'insideEndBottom',
+            color: '#f85149', fontSize: 11},
+    lineStyle: {color: '#f85149', type: 'dashed', width: 1.5},
+  }));
+
+  // K线缩放: 滚轮/拖动(inside) + 底部滑块; 首次默认显示最近25%, 之后保留用户缩放
+  const zoomOpts = [
+    {type:'inside', xAxisIndex:[0,1]},
+    {type:'slider', xAxisIndex:[0,1], bottom:4, height:16}
+  ];
+  // getOption() 在实例首次 setOption 前返回 undefined, 需判空
+  const curOpt = klineChart.getOption();
+  if (!curOpt || !curOpt.dataZoom) {
+    zoomOpts.forEach(z => { z.start = 75; z.end = 100; });
+  }
 
   klineChart.setOption({
     grid: [{left:'8%',right:'3%',top:'5%',height:'55%'},
@@ -1007,13 +1648,23 @@ function updateCharts(data) {
             {type:'category',data:dates,gridIndex:1,axisLabel:{fontSize:10}}],
     yAxis: [{type:'value',gridIndex:0,scale:true,splitArea:{show:true}},
             {type:'value',gridIndex:1}],
+    dataZoom: zoomOpts,
     series: [
       {name:'K线',type:'candlestick',data:kdata,xAxisIndex:0,yAxisIndex:0,
-       itemStyle:{color:'#3fb950',color0:'#f85149',borderColor:'#3fb950',borderColor0:'#f85149'}},
+       itemStyle:{color:'#3fb950',color0:'#f85149',borderColor:'#3fb950',borderColor0:'#f85149'},
+       markLine:{silent:true,symbol:'none',animation:false,data:suppMarks.concat(resMarks)}},
+      {name:'BOLL上轨',type:'line',data:data.boll_upper,xAxisIndex:0,yAxisIndex:0,
+       symbol:'none',lineStyle:{width:1,color:'#8b949e',opacity:0.7},z:2},
+      {name:'BOLL中轨',type:'line',data:data.boll_mid,xAxisIndex:0,yAxisIndex:0,
+       symbol:'none',lineStyle:{width:1,color:'#2f81f7',opacity:0.8},z:2},
+      {name:'BOLL下轨',type:'line',data:data.boll_lower,xAxisIndex:0,yAxisIndex:0,
+       symbol:'none',lineStyle:{width:1,color:'#8b949e',opacity:0.7},z:2},
       {name:'买点',type:'scatter',data:buyMarks,xAxisIndex:0,yAxisIndex:0,
        symbol:'triangle',symbolSize:12,itemStyle:{color:'#3fb950'}},
       {name:'卖点',type:'scatter',data:sellMarks,xAxisIndex:0,yAxisIndex:0,
        symbol:'triangle',symbolSize:12,symbolRotate:180,itemStyle:{color:'#f85149'}},
+      {name:'平仓点',type:'scatter',data:closeMarks,xAxisIndex:0,yAxisIndex:0,
+       symbol:'circle',symbolSize:9,itemStyle:{color:'#f0883e'}},
       {name:'量',type:'bar',data:volData,xAxisIndex:1,yAxisIndex:1,
        itemStyle:{color:params=>params.data[2]>0?'#3fb950':'#f85149'}},
       {name:'VolMA20',type:'line',data:volMaData,xAxisIndex:1,yAxisIndex:1,
@@ -1024,8 +1675,8 @@ function updateCharts(data) {
   });
 
   // ROC图
-  const roc5Data = data.roc5.map(v => v[1]);
-  const roc20Data = data.roc20.map(v => v[1]);
+  const roc5Data = data.roc5;
+  const roc20Data = data.roc20;
   rocChart.setOption({
     grid:{left:'8%',right:'3%',top:'5%',bottom:'10%'},
     xAxis:{type:'category',data:dates,axisLabel:{fontSize:10}},
@@ -1044,14 +1695,41 @@ function updatePanel(data) {
   const price = data.last_price;
   document.getElementById('price-display').innerHTML = `$${price.toFixed(2)}`;
 
-  // 指标 (含 ATR)
+  // 指标 (五维共振全指标)
   const s = data.indicator_state || {};
   document.getElementById('ind-roc5').textContent = (s.roc5||0).toFixed(4) + '%';
   document.getElementById('ind-roc20').textContent = (s.roc20||0).toFixed(4) + '%';
+  document.getElementById('ind-roc50').textContent = (s.roc50||0).toFixed(4) + '%';
+  document.getElementById('ind-ma50').textContent = (s.trend_ma||0).toFixed(1);
   document.getElementById('ind-vol').textContent = (s.volume||0).toFixed(1);
   document.getElementById('ind-volma').textContent = (s.vol_ma||0).toFixed(1);
   document.getElementById('ind-volratio').textContent = (s.vol_ratio||0).toFixed(2) + 'x';
   document.getElementById('ind-atr').textContent = (s.atr||0).toFixed(2);
+
+  // 趋势 + 支撑位
+  const tr = data.trend_state || {};
+  const trendEl = document.getElementById('ind-trend');
+  if (tr.label && tr.trend !== 'unknown') {
+    const tcls = tr.trend === 'up' ? 'trend-up' : (tr.trend === 'down' ? 'trend-down' : 'trend-side');
+    const tico = tr.trend === 'up' ? '📈' : (tr.trend === 'down' ? '📉' : '↔️');
+    trendEl.innerHTML = `<span class="${tcls}">${tico} ${tr.label}</span>`;
+  } else {
+    trendEl.textContent = '--';
+  }
+  const supps = data.supports || [];
+  document.getElementById('ind-supports').textContent =
+    supps.length ? supps.map(x => x.price).join(' / ') : '--';
+  const reses = data.resistances || [];
+  document.getElementById('ind-resist').textContent =
+    reses.length ? reses.map(x => x.price).join(' / ') : '--';
+  const bUp = data.boll_upper, bMid = data.boll_mid, bLo = data.boll_lower;
+  if (bUp && bMid && bLo && bUp.length && bUp[bUp.length-1] != null) {
+    document.getElementById('ind-boll').textContent =
+      `${bUp[bUp.length-1].toFixed(2)} / ${bMid[bMid.length-1].toFixed(2)} / ${bLo[bLo.length-1].toFixed(2)}`;
+  } else {
+    document.getElementById('ind-boll').textContent = '--';
+  }
+  document.getElementById('ind-atr-state').textContent = (s.atr_state||0).toFixed(2);
 
   // 账户概览
   document.getElementById('acc-balance').textContent = (data.balance||0).toFixed(2) + ' U';
@@ -1103,19 +1781,32 @@ function updatePanel(data) {
     }
   } else if (rdy.long_ready) {
     alertDiv.className += ' buy';
-    alertDiv.innerHTML = '📈 <b>做多信号就绪！</b><br>ROC(10)>0 & ROC(25)>0 & 放量';
+    alertDiv.innerHTML = '📈 <b>做多信号就绪！</b><br>ROC(8)>0 & ROC(20)>0 & 放量 & 价>MA50 & ROC50>0 & ATR放大';
   } else if (rdy.short_ready) {
     alertDiv.className += ' sell';
-    alertDiv.innerHTML = '📉 <b>做空信号就绪！</b><br>ROC(10)<0 & ROC(25)<0 & 放量';
+    alertDiv.innerHTML = '📉 <b>做空信号就绪！</b><br>ROC(8)<0 & ROC(20)<0 & 放量 & 价<MA50 & ROC50<0 & ATR放大';
   } else {
     alertDiv.className += ' neutral';
     alertDiv.innerHTML = '⚪ 等待入场信号<br><small>条件未全部满足</small>';
   }
 
-  // 条件检查
-  updateCondition('cond-vol', rdy.vol_confirmed, '成交量 > VolMA(30)');
-  updateCondition('cond-long', rdy.long_ready, 'ROC(10)>0 & ROC(25)>0 & ROC(10)>ROC(25)');
-  updateCondition('cond-short', rdy.short_ready, 'ROC(10)<0 & ROC(25)<0 & ROC(10)<ROC(25)');
+  // 条件检查 (五维共振逐条)
+  updateCondition('cond-vol', rdy.vol_confirmed);
+  updateCondition('cond-atr', rdy.atr_expanding);
+  // 做多逐维度
+  updateCondition('cond-l-roc5', rdy.long_roc5);
+  updateCondition('cond-l-roc20', rdy.long_roc20);
+  updateCondition('cond-l-acc', rdy.long_acc);
+  updateCondition('cond-l-trend', rdy.long_trend);
+  updateCondition('cond-l-roc50', rdy.long_roc50);
+  updateCondGroup('cond-long-group', 'long', [rdy.long_roc5, rdy.long_roc20, rdy.long_acc, rdy.long_trend, rdy.long_roc50]);
+  // 做空逐维度
+  updateCondition('cond-s-roc5', rdy.short_roc5);
+  updateCondition('cond-s-roc20', rdy.short_roc20);
+  updateCondition('cond-s-acc', rdy.short_acc);
+  updateCondition('cond-s-trend', rdy.short_trend);
+  updateCondition('cond-s-roc50', rdy.short_roc50);
+  updateCondGroup('cond-short-group', 'short', [rdy.short_roc5, rdy.short_roc20, rdy.short_acc, rdy.short_trend, rdy.short_roc50]);
 
   // 最近交易
   const tradeListDiv = document.getElementById('trade-list');
@@ -1134,16 +1825,29 @@ function updatePanel(data) {
     </div>`;
   }).join('') || '<div style="color:#8b949e;font-size:12px;text-align:center;padding:10px">暂无交易</div>';
 
-  // 历史信号列表
+  // 历史信号列表 (BUY/SELL 开仓 + CLOSE 平仓)
   const listDiv = document.getElementById('signal-list');
   const signals = data.signals || [];
   if (signals.length !== currentSignals.length) {
     currentSignals = signals;
     listDiv.innerHTML = signals.slice().reverse().map(s => {
+      const d = new Date(s.ts + 3600000); // 信号触发(收盘)时刻=开盘+1h, 与微信通知一致
+      const t = d.toLocaleString('zh-CN', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+      if (s.type === 'CLOSE') {
+        const dirTxt = s.direction === 'long' ? '📈多' : '📉空';
+        const pnl = s.pnl || 0;
+        const pnlCls = pnl >= 0 ? 'pos' : 'neg';
+        const reasonMap = {'momentum_death':'动量衰竭','SL':'止损','TP':'止盈','timeout':'超时','force_close':'强平'};
+        return `<div class="signal-item close-signal">
+          <span class="dir">🔚${dirTxt}</span>
+          <span class="price">$${s.entry_price}→$${s.price.toFixed(2)}</span>
+          <span class="t-pnl ${pnlCls}">${pnl>=0?'+':''}${pnl.toFixed(2)}U</span>
+          <span class="t-reason">${reasonMap[s.reason]||s.reason}·${s.held_bars}根</span>
+          <span class="time">${t}</span>
+        </div>`;
+      }
       const cls = s.type === 'BUY' ? 'buy-signal' : 'sell-signal';
       const dir = s.type === 'BUY' ? '📈多' : '📉空';
-      const d = new Date(s.ts);
-      const t = d.toLocaleString('zh-CN', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
       return `<div class="signal-item ${cls}">
         <span class="dir">${dir}</span>
         <span class="price">$${s.price.toFixed(2)}</span>
@@ -1163,6 +1867,15 @@ function updateCondition(id, met, text) {
     el.className = 'condition not-met';
     el.querySelector('.icon').textContent = '❌';
   }
+}
+
+function updateCondGroup(groupId, side, states) {
+  // 多/空共振分组: 更新标题计数 + 全满足时高亮边框
+  const el = document.getElementById(groupId);
+  const metCount = states.filter(Boolean).length;
+  const label = side === 'long' ? '🟢 做多共振' : '🔴 做空共振';
+  el.querySelector('.cond-group-title').textContent = `${label} (${metCount}/5)`;
+  el.className = 'cond-group ' + side + (metCount === 5 ? ' ready' : '');
 }
 
 // WebSocket 连接
@@ -1192,15 +1905,53 @@ function connectWS() {
 window.onload = () => {
   initKlineChart();
   connectWS();
+  initManualOrder();
   window.onresize = () => { klineChart?.resize(); rocChart?.resize(); };
 };
+
+// ===== 手动下单 =====
+function initManualOrder() {
+  let oSide = 'buy';
+  const obuy = document.getElementById('obuy'), osell = document.getElementById('osell');
+  const omsg = document.getElementById('omsg');
+  obuy.addEventListener('click', () => { oSide='buy'; obuy.classList.add('active'); osell.classList.remove('active'); });
+  osell.addEventListener('click', () => { oSide='sell'; osell.classList.add('active'); obuy.classList.remove('active'); });
+  document.getElementById('otype').addEventListener('change', (e) => {
+    document.getElementById('price-row').style.display = e.target.value === 'limit' ? '' : 'none';
+  });
+  document.getElementById('osubmit').addEventListener('click', async () => {
+    const body = {
+      side: oSide,
+      order_type: document.getElementById('otype').value,
+      leverage: parseInt(document.getElementById('olev').value),
+      usdt: parseFloat(document.getElementById('ousdt').value),
+    };
+    if (body.order_type === 'limit') {
+      body.price = parseFloat(document.getElementById('oprice').value);
+      if (!body.price || body.price <= 0) { omsg.className='o-msg err'; omsg.textContent='请填写有效限价'; return; }
+    }
+    if (!body.usdt || body.usdt <= 0) { omsg.className='o-msg err'; omsg.textContent='请填写下单金额'; return; }
+    omsg.className='o-msg'; omsg.textContent='下单中...';
+    try {
+      const r = await fetch('/api/manual_order', {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      omsg.className = 'o-msg ' + (j.ok ? 'ok' : 'err');
+      omsg.textContent = j.message || JSON.stringify(j);
+      if (j.ok) setTimeout(() => { omsg.className='o-msg'; omsg.textContent=''; }, 8000);
+    } catch (e) {
+      omsg.className='o-msg err'; omsg.textContent='请求失败: ' + e.message;
+    }
+  });
+}
 </script>
 </body>
 </html>'''
 
 
 # ==================== FastAPI ====================
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -1231,6 +1982,171 @@ async def lifespan(app: FastAPI):
     trader.stop()
 
 
+HTML_PAGE_FLOW = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ETH 大资金流向 — 实时监控 (合约)</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0d1117; color: #c9d1d9; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 14px; }
+.header { display: flex; align-items: center; gap: 16px; padding: 10px 20px; background: #161b22; border-bottom: 1px solid #30363d; height: 50px; }
+.header h1 { font-size: 16px; font-weight: 600; color: #f0f6fc; }
+.live-dot { display: inline-block; width: 8px; height: 8px; background: #3fb950; border-radius: 50%; margin-right: 6px; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.nav { display: flex; gap: 4px; }
+.nav a { padding: 5px 12px; color: #8b949e; text-decoration: none; border-radius: 4px; font-size: 13px; }
+.nav a:hover { background: #21262d; color: #f0f6fc; }
+.nav a.active { background: #1f6feb; color: #fff; }
+.price-display { margin-left: auto; font-size: 16px; font-weight: 700; color: #3fb950; }
+.container { padding: 16px 20px; max-width: 1400px; margin: 0 auto; }
+.section-title { font-size: 14px; font-weight: 600; color: #f0f6fc; margin: 16px 0 8px; padding-bottom: 6px; border-bottom: 1px solid #30363d; }
+.stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.stat-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+.stat-card .window { font-size: 12px; color: #8b949e; margin-bottom: 6px; }
+.stat-card .net { font-size: 24px; font-weight: 700; }
+.stat-card .net.pos { color: #3fb950; }
+.stat-card .net.neg { color: #f85149; }
+.stat-card .detail { font-size: 11px; color: #8b949e; margin-top: 8px; display: flex; justify-content: space-between; }
+.stat-card .detail .buy { color: #3fb950; }
+.stat-card .detail .sell { color: #f85149; }
+.order-list { background: #161b22; border: 1px solid #30363d; border-radius: 8px; max-height: 520px; overflow-y: auto; }
+.order-list:empty::before { content: "⏳ 等待大单成交 (单笔 ≥ 10万U)..."; display: block; padding: 30px; text-align: center; color: #8b949e; }
+.order-item { display: flex; align-items: center; gap: 10px; padding: 7px 14px; border-bottom: 1px solid #21262d; font-size: 13px; }
+.order-item.buy { border-left: 3px solid #3fb950; }
+.order-item.sell { border-left: 3px solid #f85149; }
+.order-item .side { width: 48px; font-weight: 600; }
+.order-item.buy .side { color: #3fb950; }
+.order-item.sell .side { color: #f85149; }
+.order-item .usdt { flex: 1; text-align: right; font-weight: 600; color: #f0f6fc; }
+.order-item .price { color: #8b949e; width: 90px; text-align: right; }
+.order-item .time { color: #6e7681; width: 70px; text-align: right; font-size: 11px; }
+.lsr-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; margin-top: 12px; display: none; }
+.lsr-row { display: flex; justify-content: space-between; padding: 5px 0; font-size: 13px; border-bottom: 1px solid #21262d; }
+.lsr-row:last-child { border-bottom: none; }
+.lsr-row .label { color: #8b949e; }
+.lsr-row .value { color: #f0f6fc; font-weight: 600; }
+.empty-hint { color: #6e7681; font-size: 12px; padding: 8px 0; }
+.app-shell{display:flex;min-height:100vh}
+.app-sidebar{width:190px;flex-shrink:0;background:#161b22;border-right:2px solid #30363d;display:flex;flex-direction:column;padding:16px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+.app-sidebar .logo{font-size:15px;font-weight:700;color:#58a6ff;padding:0 18px 14px;border-bottom:1px solid #30363d;white-space:nowrap}
+.app-sidebar .nav-group{margin-top:14px}
+.app-sidebar .group-title{font-size:11px;color:#8b949e;padding:0 18px;margin-bottom:4px;letter-spacing:.5px}
+.app-sidebar a{display:block;padding:8px 18px;color:#8b949e;text-decoration:none;font-size:13px;border-left:3px solid transparent;white-space:nowrap}
+.app-sidebar a:hover{color:#f0f6fc;background:#21262d}
+.app-sidebar a.active{color:#58a6ff;background:#1f6feb22;border-left-color:#1f6feb}
+.app-main{flex:1;min-width:0}
+</style>
+</head>
+<body>
+
+<div class="app-shell">
+  <div class="app-sidebar">
+    <div class="logo">📈 ETH 量化平台</div>
+    <nav class="nav-group">
+      <div class="group-title">导航</div>
+      <a href="http://127.0.0.1:8082/info">🏠 信息</a>
+      <a href="http://127.0.0.1:8082/alpha">🧪 Alpha回测</a>
+      <a href="http://127.0.0.1:8082/reports">📊 策略及回测</a>
+      <a href="http://127.0.0.1:8082/testnet">🔌 Testnet</a>
+    </nav>
+    <nav class="nav-group">
+      <div class="group-title">现货 · 8080</div>
+      <a href="http://127.0.0.1:8080/">📊 信号</a>
+      <a href="http://127.0.0.1:8080/flow">🐋 大资金</a>
+    </nav>
+    <nav class="nav-group">
+      <div class="group-title">合约 · 8081</div>
+      <a href="/">📊 信号</a>
+      <a href="/flow" class="active">🐋 大资金</a>
+    </nav>
+  </div>
+  <div class="app-main">
+    <div class="header">
+      <h1><span class="live-dot"></span>ETH 大资金流向 — 实时监控 (合约)</h1>
+      <div class="price-display" id="price-display">--</div>
+    </div>
+
+<div class="container">
+  <div class="section-title">📊 大单净买卖统计</div>
+  <div class="stats-grid" id="stats-grid">
+    <div class="empty-hint">连接中...</div>
+  </div>
+
+  <div class="lsr-box" id="lsr-box">
+    <div class="section-title" style="margin-top:0">👥 大户多空比</div>
+    <div id="lsr-content"></div>
+  </div>
+
+  <div class="section-title">📋 大单滚动 (单笔 ≥ 10万U)</div>
+  <div class="order-list" id="order-list"></div>
+</div>
+  </div>
+</div>
+
+<script>
+const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+ws.onopen = () => console.log('WS connected');
+ws.onmessage = (e) => {
+  let msg;
+  try { msg = JSON.parse(e.data); } catch(_) { return; }
+  if (msg.type !== 'init' && msg.type !== 'update') return;
+  const d = msg.data || {};
+
+  if (d.last_price) document.getElementById('price-display').textContent = '$' + d.last_price;
+
+  const grid = document.getElementById('stats-grid');
+  const stats = d.flow_stats || [];
+  if (stats.length) {
+    grid.innerHTML = stats.map(s => {
+      const pos = s.net >= 0;
+      const cls = pos ? 'pos' : 'neg';
+      const sign = pos ? '+' : '';
+      return '<div class="stat-card">' +
+        '<div class="window">' + s.window + ' 分钟净买卖</div>' +
+        '<div class="net ' + cls + '">' + sign + (s.net/10000).toFixed(1) + '万U</div>' +
+        '<div class="detail">' +
+          '<span class="buy">买 ' + (s.buy/10000).toFixed(1) + '万</span>' +
+          '<span>比 ' + s.ratio + 'x</span>' +
+          '<span class="sell">卖 ' + (s.sell/10000).toFixed(1) + '万</span>' +
+        '</div></div>';
+    }).join('');
+  }
+
+  const lsrBox = document.getElementById('lsr-box');
+  if (d.long_short_ratio) {
+    lsrBox.style.display = 'block';
+    const r = d.long_short_ratio;
+    document.getElementById('lsr-content').innerHTML =
+      '<div class="lsr-row"><span class="label">大户持仓多空比</span><span class="value">' + r.top_ratio.toFixed(3) + ' (多 ' + (r.top_long*100).toFixed(1) + '% / 空 ' + (r.top_short*100).toFixed(1) + '%)</span></div>' +
+      '<div class="lsr-row"><span class="label">账户多空比</span><span class="value">' + r.acct_ratio.toFixed(3) + ' (多 ' + (r.acct_long*100).toFixed(1) + '% / 空 ' + (r.acct_short*100).toFixed(1) + '%)</span></div>';
+  } else {
+    lsrBox.style.display = 'none';
+  }
+
+  const list = document.getElementById('order-list');
+  const orders = d.large_orders || [];
+  list.innerHTML = orders.slice().reverse().map(o => {
+    const cls = o.side === 'buy' ? 'buy' : 'sell';
+    const emoji = o.side === 'buy' ? '🟢买' : '🔴卖';
+    const dt = new Date(o.ts);
+    const t = dt.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    return '<div class="order-item ' + cls + '">' +
+      '<span class="side">' + emoji + '</span>' +
+      '<span class="usdt">' + (o.usdt/10000).toFixed(1) + '万U</span>' +
+      '<span class="price">$' + o.price + '</span>' +
+      '<span class="time">' + t + '</span>' +
+    '</div>';
+  }).join('');
+};
+ws.onclose = () => { document.getElementById('price-display').textContent = '连接断开, 重连中...'; };
+</script>
+</body>
+</html>
+"""
+
+
 app = FastAPI(title="ETH v12 合约实时交易信号", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -1240,9 +2156,42 @@ async def index():
     return HTMLResponse(HTML_PAGE)
 
 
+@app.get("/flow")
+async def flow_page():
+    return HTMLResponse(HTML_PAGE_FLOW)
+
+
 @app.get("/api/data")
 async def api_data():
     return JSONResponse(trader.get_chart_data())
+
+
+@app.post("/api/manual_order")
+async def api_manual_order(req: Request):
+    """手动下单(模拟): body = {side: buy|sell, order_type: market|limit, price?, usdt, leverage?}"""
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"ok": False, "message": "无效的请求体"}, status_code=400)
+    side = str(body.get("side", "")).lower()
+    otype = str(body.get("order_type", "")).lower()
+    price = body.get("price")
+    usdt = body.get("usdt")
+    lev = int(body.get("leverage") or LEVERAGE)
+    if side not in ("buy", "sell"):
+        return JSONResponse({"ok": False, "message": "方向必须为 buy 或 sell"})
+    if otype not in ("market", "limit"):
+        return JSONResponse({"ok": False, "message": "类型必须为 market 或 limit"})
+    if otype == "limit" and (price is None or float(price) <= 0):
+        return JSONResponse({"ok": False, "message": "限价单必须填写有效价格"})
+    if usdt is None or float(usdt) <= 0:
+        return JSONResponse({"ok": False, "message": "请填写下单金额(USDT)"})
+    usdt = float(usdt)
+    exec_price = trader.last_price if otype == "market" else float(price)
+    if not exec_price or exec_price <= 0:
+        return JSONResponse({"ok": False, "message": "当前价格不可用, 请稍后再试"})
+    result = trader.manual_order(side, exec_price, usdt, lev, int(time.time() * 1000))
+    return JSONResponse(result)
 
 
 @app.get("/health")
@@ -1326,7 +2275,8 @@ def _print_signal_with_broadcast(signal):
         f"- **ROC({ROC_SHORT})**: {signal['roc5']}%\n"
         f"- **ROC({ROC_MEDIUM})**: {signal['roc20']}%\n"
         f"- **ATR**: {signal.get('atr', '?')}\n"
-        f"- **时间**: {ts_to_str(signal['ts'])}\n"
+        f"- **K线时间(开盘)**: {ts_to_str(signal['ts'])}\n"
+        f"- **信号触发(收盘)**: {now()}\n"
         f"- **仓位**: {signal.get('size_usdt', '?')} USDT ({FRACTION_BASE*100:.0f}% × {LEVERAGE}x)\n"
         f"- **止损**: {signal.get('sl_price', '?')} USDT ({SL_ATR_MULT}×ATR)\n"
         f"- **止盈**: {signal.get('tp_price', '?')} USDT ({TP_ATR_MULT}×ATR)\n"
@@ -1356,7 +2306,8 @@ def _print_close_with_broadcast(trade):
         f"- **平仓价**: {trade['exit_price']} USDT\n"
         f"- **盈亏**: {pnl:+.4f} USDT\n"
         f"- **持仓**: {trade['held_bars']}根K线\n"
-        f"- **时间**: {ts_to_str(trade['exit_time'])}\n"
+        f"- **K线时间(开盘)**: {ts_to_str(trade['exit_time'])}\n"
+        f"- **信号触发(收盘)**: {now()}\n"
         f"- **余额**: {trader.balance:.2f} USDT\n"
         f"\n> ETH 双ROC动量策略 · 合约实时交易"
     )
@@ -1364,6 +2315,27 @@ def _print_close_with_broadcast(trade):
 trader._print_close = _print_close_with_broadcast
 
 
+def _check_single_instance():
+    """单实例守卫: 开发环境偶尔把一条命令拉起两个进程(克隆), 会抢同一 8081 端口互相冲突。
+    用 Windows 命名互斥量让后启动的克隆自动退出 (必须 use_last_error=True, 直接调
+    GetLastError 会被 ctypes 内部调用覆盖导致失效)"""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    CreateMutexW = k32.CreateMutexW
+    CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    CreateMutexW.restype = wintypes.HANDLE
+    for name in ("Local\\live_trader_contract_single", "Global\\live_trader_contract_single"):
+        h = CreateMutexW(None, True, name)
+        if not h:
+            continue
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            print(f"[{time.strftime('%H:%M:%S')}] 已有 live_trader_contract 实例运行, 本实例退出")
+            sys.exit(0)
+        return h  # 保持引用, 防止句柄被 GC 释放
+
+
 if __name__ == "__main__":
+    _hold = _check_single_instance()  # 单实例守卫: 克隆进程启动即退出, 防止抢 8081 端口
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=SERVER_PORT, log_level="warning")

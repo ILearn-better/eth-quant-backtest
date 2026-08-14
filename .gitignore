@@ -34,3 +34,28 @@ desktop.ini
 
 # ===== WorkBuddy 项目数据 =====
 .workbuddy/
+
+# ===== Testnet API 密钥 (含敏感 Key/Secret, 不入库) =====
+config_testnet.json
+
+# ===== 运行日志 / 临时调试文件 (不入库) =====
+*.log
+*_err.log
+_*.txt
+*_out.txt
+dl_accum*.jsonl
+dl_*progress*.txt
+health_check.txt
+net_test.txt
+result_*.txt
+
+# ===== 模拟盘运行状态 (交易记录/余额, 不入库) =====
+data/signals_spot.jsonl
+data/futures/signals_contract.jsonl
+data/futures/state_contract.json
+
+# ===== 大体积分钟级历史数据 (不入库, 按需另存) =====
+data/futures/ETHUSDT-5m-full.csv
+data/futures/ETHUSDT-5m.csv
+data/futures/ETHUSDT-5m-2021-2023.csv
+data/futures/ETHUSDT-5m-miss-2026.csv

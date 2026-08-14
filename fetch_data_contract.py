@@ -1,38 +1,73 @@
-"""下载 ETHUSDT 合约(USDⓈ-M Futures) 近5年 1h K线数据 - Binance Futures API
+"""下载 ETHUSDT 合约(USDⓈ-M Futures) K线数据 - Binance Futures API
 
 数据源: datasource.FUTURES (fapi.binance.com)
-输出: data/futures/ETHUSDT-1h.csv (独立目录, 不污染现货 data/)
+用法:
+  python fetch_data_contract.py [interval] [years]
+    interval: 1h(默认) / 5m / 15m / 1d ...
+    years:    近N年数据(默认 5)
+输出: data/futures/ETHUSDT-<interval>.csv (独立目录, 不污染现货 data/)
 """
 import csv
 import os
 import time
 import sys
 
+# Windows 终端/重定向 UTF-8 兼容 (print 含 ✓❌ 等字符, 避免 GBK 编码崩溃)
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from datasource import FUTURES
 
 SYMBOL = "ETHUSDT"
-INTERVAL = "1h"
-OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "futures", "ETHUSDT-1h.csv")
+INTERVAL = sys.argv[1] if len(sys.argv) > 1 else "1h"
+YEARS = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
+OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "futures", f"ETHUSDT-{INTERVAL}.csv")
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 
 
-def fetch_klines(start_time, end_time, limit=1000):
+_session = None
+def _get_session():
+    """复用连接, 减少 SSL 握手 (频繁 SSLError 的根因是每批新建连接)"""
+    global _session
+    if _session is None:
+        import requests
+        _session = requests.Session()
+    return _session
+
+
+def fetch_klines(start_time, end_time, limit=1500):
     import requests
     url = FUTURES["rest_kline"]
     params = {"symbol": SYMBOL, "interval": INTERVAL, "startTime": start_time, "endTime": end_time, "limit": limit}
-    proxies = {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}
-    resp = requests.get(url, params=params, timeout=60, proxies=proxies)
-    resp.raise_for_status()
-    return resp.json()
+    # 直连优先, 失败走代理 (与 live_trader_contract._rest_get 策略一致)
+    try:
+        resp = _get_session().get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        proxies = {"http": "http://127.0.0.1:7897", "https": "http://127.0.0.1:7897"}
+        resp = requests.get(url, params=params, timeout=30, proxies=proxies)
+        resp.raise_for_status()
+        return resp.json()
 
 
 def download():
     now_ms = int(time.time() * 1000)
-    start_ms = now_ms - 5 * 365 * 24 * 3600 * 1000
+    start_ms = now_ms - int(YEARS * 365 * 24 * 3600 * 1000)
     all_klines = []
     current = start_ms
     batch = 0
-    print(f"{'='*60}\n下载 {SYMBOL} {FUTURES['name']} {INTERVAL} (近5年)\n数据源: {FUTURES['rest_kline']}\n目标: {time.strftime('%Y-%m-%d', time.localtime(start_ms/1000))} ~ now\n{'='*60}")
+    progress_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dl_progress.txt")
+    print(f"{'='*60}\n下载 {SYMBOL} {FUTURES['name']} {INTERVAL} (近{YEARS:g}年)\n数据源: {FUTURES['rest_kline']}\n目标: {time.strftime('%Y-%m-%d', time.localtime(start_ms/1000))} ~ now\n{'='*60}")
+
+    def log_progress(msg):
+        print(msg)
+        try:
+            with open(progress_file, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
 
     while current < now_ms:
         batch += 1
@@ -43,7 +78,7 @@ def download():
             except Exception as e:
                 wait = min(3 + attempt * 4, 30)
                 if attempt < 7:
-                    print(f"  批次{batch} 重试{attempt+1}/8: 等{wait}s... ({type(e).__name__})")
+                    log_progress(f"  批次{batch} 重试{attempt+1}/8: 等{wait}s... ({type(e).__name__})")
                     time.sleep(wait)
                 else:
                     raise
@@ -53,10 +88,10 @@ def download():
         current = int(data[-1][0]) + 1
         t1 = time.strftime('%Y-%m-%d %H:%M', time.localtime(int(data[0][0])/1000))
         t2 = time.strftime('%Y-%m-%d %H:%M', time.localtime(int(data[-1][0])/1000))
-        print(f"  ✓ 批次{batch}: +{len(data)} | {t1} ~ {t2} | 总计 {len(all_klines)}")
+        log_progress(f"  ✓ 批次{batch}: +{len(data)} | {t1} ~ {t2} | 总计 {len(all_klines)}")
         if len(data) < 500:
             break
-        time.sleep(0.2)
+        time.sleep(0.15)
     return all_klines
 
 

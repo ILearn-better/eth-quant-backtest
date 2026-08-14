@@ -146,7 +146,16 @@ def plot_equity_chart(equity_curve, initial_capital, output_path,
         for e in equity_curve:
             ts_to_value[int(e[0])] = float(e[1])
 
-        for idx, t in enumerate(trades):
+        # 交易过多时抽样标注: 几千笔交易全标会创建数万个 annotate 对象, matplotlib 渲染卡死
+        # (低交易量 ≤120 笔时行为不变, 与原来完全一致)
+        max_labels = 120
+        label_trades = trades
+        if len(trades) > max_labels:
+            step = len(trades) / max_labels
+            idxs = sorted(set([0, len(trades) - 1] + [int(i * step) for i in range(max_labels)]))
+            label_trades = [trades[i] for i in idxs]
+
+        for idx, t in enumerate(label_trades):
             entry_ts = t.get("entry_time", 0)
             exit_ts = t.get("exit_time", 0)
             direction = t.get("direction", "")
