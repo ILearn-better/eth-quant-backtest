@@ -32,6 +32,7 @@ from alpha_lab.backtest import load_data, run_backtest, available_data_files
 from alpha_lab.operators import OPERATORS, FIELDS
 from alpha_lab import storage
 from binance_testnet import TestnetClient
+import daily_log  # 按天双写日志: logs/alpha/YYYY-MM-DD.log
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "dashboard_static")
@@ -1302,6 +1303,7 @@ app.mount("/reports", StaticFiles(directory=os.path.join(BASE_DIR, "reports")), 
 
 if __name__ == "__main__":
     import uvicorn
+    daily_log.setup("alpha")  # 控制台 + logs/alpha/<当天日期>.log
     print("=" * 60)
     print("  🧪 Alpha 因子实验室: http://127.0.0.1:8082/alpha")
     print("=" * 60)

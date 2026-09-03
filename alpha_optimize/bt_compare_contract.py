@@ -4,14 +4,14 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 
 from strategies.eth_roc_momentum_contract import EthROCMomentumContract
 from strategies.eth_roc_momentum_contract_resonance import EthROCMomentumContractResonance
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result_resonance.txt")
+OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "result_resonance.txt")
 lines = []
 
 

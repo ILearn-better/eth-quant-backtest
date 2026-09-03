@@ -26,6 +26,8 @@ import urllib.error
 import urllib.parse
 import ssl
 
+import daily_log  # 按天双写日志: logs/contract/YYYY-MM-DD.log
+
 # Windows 终端 UTF-8 兼容
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1009,8 +1011,14 @@ class LiveTrader:
         ⚠️ 死锁防御: check_signal() → compute_indicators() 会再次获取 self.lock,
         threading.Lock 不可重入 → 必须在锁外调用 check_signal/_print_status/_print_signal。
         """
+        last_heal = 0.0
         while self.running:
             try:
+                # 自愈: 启动回补失败导致缓冲不足(只有几根K线) → 每30s重试拉全量历史
+                # (limit=2 轮询只能维持最新2根, 不主动回补前端永远只有2根K线)
+                if len(self.bars) < HISTORY_BARS and time.time() - last_heal >= 30:
+                    last_heal = time.time()
+                    self.fetch_history()
                 data = self._rest_get(f"{REST_KLINE_URL}?symbol=ETHUSDT&interval=1h&limit=2")
                 if not data:
                     time.sleep(5); continue
@@ -2338,4 +2346,5 @@ def _check_single_instance():
 if __name__ == "__main__":
     _hold = _check_single_instance()  # 单实例守卫: 克隆进程启动即退出, 防止抢 8081 端口
     import uvicorn
+    daily_log.setup("contract")  # 控制台 + logs/contract/<当天日期>.log
     uvicorn.run(app, host="127.0.0.1", port=SERVER_PORT, log_level="warning")

@@ -23,6 +23,8 @@ import urllib.error
 import urllib.parse
 import ssl
 
+import daily_log  # 按天双写日志: logs/spot/YYYY-MM-DD.log
+
 # Windows 终端 UTF-8 兼容
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1900,4 +1902,5 @@ trader._print_signal = _print_signal_with_broadcast
 
 if __name__ == "__main__":
     import uvicorn
+    daily_log.setup("spot")  # 控制台 + logs/spot/<当天日期>.log
     uvicorn.run(app, host="127.0.0.1", port=8080, log_level="warning")

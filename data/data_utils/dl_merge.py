@@ -6,7 +6,7 @@ import csv
 import os
 import sys
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SOURCES = sys.argv[1:] if len(sys.argv) > 1 else [
     os.path.join(BASE_DIR, "data", "futures", "ETHUSDT-5m-2021-2023.csv"),
     os.path.join(BASE_DIR, "data", "futures", "ETHUSDT-5m.csv"),

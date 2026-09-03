@@ -9,7 +9,7 @@ import sys
 import time
 import argparse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import numpy as np
@@ -81,7 +81,7 @@ def main():
     args = parser.parse_args()
     quick = args.quick
 
-    data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ETHUSDT-1h.csv")
+    data_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ETHUSDT-1h.csv")
     df = load_data(data_file)
 
     print("=" * 100)

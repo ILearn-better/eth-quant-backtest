@@ -13,7 +13,7 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategies.eth_extreme_reversion_contract import EthExtremeReversionContract
 from base import generate_html_report
@@ -48,7 +48,7 @@ def load_data(csv_path):
 
 
 def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     data_file = os.path.join(base_dir, "data", "futures", "ETHUSDT-1h.csv")
     if not os.path.exists(data_file):
         print(f"❌ {MARKET}数据文件不存在: {data_file}")

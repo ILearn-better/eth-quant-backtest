@@ -9,7 +9,7 @@ import os
 import sys
 import datetime
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_FILE = os.path.join(BASE_DIR, "paper_state", "state.json")
 TRADES_FILE = os.path.join(BASE_DIR, "paper_state", "trades.jsonl")
 SNAPSHOT_FILE = os.path.join(BASE_DIR, "paper_state", "daily_snapshots.jsonl")

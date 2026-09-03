@@ -7,6 +7,11 @@
     years:    近N年数据(默认 5)
 输出: data/futures/ETHUSDT-<interval>.csv (独立目录, 不污染现货 data/)
 """
+
+import os as _os, sys as _sys
+_ROOT_ = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+_sys.path.insert(0, _ROOT_)
+
 import csv
 import os
 import time
@@ -22,7 +27,7 @@ from datasource import FUTURES
 SYMBOL = "ETHUSDT"
 INTERVAL = sys.argv[1] if len(sys.argv) > 1 else "1h"
 YEARS = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
-OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "futures", f"ETHUSDT-{INTERVAL}.csv")
+OUTPUT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "futures", f"ETHUSDT-{INTERVAL}.csv")
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 
 
@@ -58,7 +63,7 @@ def download():
     all_klines = []
     current = start_ms
     batch = 0
-    progress_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dl_progress.txt")
+    progress_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "dl_progress.txt")
     print(f"{'='*60}\n下载 {SYMBOL} {FUTURES['name']} {INTERVAL} (近{YEARS:g}年)\n数据源: {FUTURES['rest_kline']}\n目标: {time.strftime('%Y-%m-%d', time.localtime(start_ms/1000))} ~ now\n{'='*60}")
 
     def log_progress(msg):

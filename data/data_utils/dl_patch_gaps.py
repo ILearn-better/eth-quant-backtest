@@ -9,11 +9,11 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import fetch_data_contract as fdc
 
 fdc.INTERVAL = "5m"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FULL = os.path.join(BASE_DIR, "data", "futures", "ETHUSDT-5m-full.csv")
 
 

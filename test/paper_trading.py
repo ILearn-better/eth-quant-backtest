@@ -38,7 +38,7 @@ def _load_env():
                     k, v = line.split("=", 1)
                     os.environ.setdefault(k.strip(), v.strip())
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _load_env()
 
 # ==================== 配置 ====================

@@ -3,7 +3,7 @@ import pandas as pd
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategies.eth_rsi_dca_v11 import EthRsiDcaV11
 from base import generate_html_report
@@ -29,7 +29,7 @@ def load_data(csv_path):
 
 
 def main():
-    data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ETHUSDT-1h.csv")
+    data_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ETHUSDT-1h.csv")
 
     if not os.path.exists(data_file):
         print(f"❌ 数据文件不存在: {data_file}")

@@ -2,7 +2,7 @@
 
 设计 (按用户要求: 单独拉取 → 每步保存为新数据文件 → 最后合并):
   - 固定时间窗: 2021-08-12 00:00 ~ 2023-08-13 00:00 (与已有 3 年数据在边界可重叠, 合并时去重)
-  - 增量落盘 dl_accum_gap.jsonl (进程被杀/中断不丢已拉段)
+  - 增量落盘 data/temp/dl_accum_gap.jsonl (进程被杀/中断不丢已拉段)
   - 重跑自动断点续传 (段内抽样判定是否已覆盖)
   - 完成后排序去重写入 data/futures/ETHUSDT-5m-2021-2023.csv (新文件, 不动已有 CSV)
   - 限流: 2 并发 + 每批间隔 2s (≈5权重/s, 远低于 2400/min; 8 并发毫秒级会触发 418 封禁)
@@ -16,11 +16,11 @@ import time
 
 _argv = sys.argv[1:]      # 先保存 dl_gap 自己的参数
 sys.argv = [sys.argv[0]]  # 屏蔽参数, 避免 fetch_data_contract import 时把日期当 INTERVAL/YEARS 解析
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import fetch_data_contract as fdc  # 复用 fetch_klines (Session 复用, 直连优先, 代理回退)
 
 fdc.INTERVAL = "5m"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 WORKERS = 1          # 并发请求数 (用户要求: 拉数据不要并发, 串行拉取控制流量)
 SEGMENT_DAYS = 90    # 每段天数 (90天=25920根 ≈ 18批)
@@ -39,8 +39,10 @@ def _parse_date(s, default):
 START_MS = _parse_date(_argv[0] if len(_argv) > 0 else "", "2021-08-12 00:00:00")
 END_MS = _parse_date(_argv[1] if len(_argv) > 1 else "", "2023-08-13 00:00:00")
 OUT_CSV = _argv[2] if len(_argv) > 2 else os.path.join(BASE_DIR, "data", "futures", "ETHUSDT-5m-2021-2023.csv")
-ACCUM = _argv[3] if len(_argv) > 3 else os.path.join(BASE_DIR, "dl_accum_gap.jsonl")
-PROGRESS = os.path.join(BASE_DIR, "dl_gap_progress.txt")
+TEMP_DIR = os.path.join(BASE_DIR, "data", "temp")   # 下载中间产物统一放 data/temp/, 不污染主目录
+os.makedirs(TEMP_DIR, exist_ok=True)
+ACCUM = _argv[3] if len(_argv) > 3 else os.path.join(TEMP_DIR, "dl_accum_gap.jsonl")
+PROGRESS = os.path.join(TEMP_DIR, "dl_gap_progress.txt")
 ACCUM_LOCK = threading.Lock()
 MUTEX = None
 

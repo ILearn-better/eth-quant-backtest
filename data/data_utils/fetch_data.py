@@ -6,7 +6,7 @@ import sys
 
 SYMBOL = "ETHUSDT"
 INTERVAL = "1h"
-OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ETHUSDT-1h.csv")
+OUTPUT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "ETHUSDT-1h.csv")
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 
 

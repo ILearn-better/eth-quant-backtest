@@ -1,7 +1,7 @@
 """临时并发下载(增量落盘版): 分段并行拉取 5m 合约数据 (完成后删除)
 
 设计:
-  - 每段完成后立即追加到 dl_accum.jsonl (进程中断不丢已拉数据)
+  - 每段完成后立即追加到 data/temp/dl_accum.jsonl (进程中断不丢已拉数据)
   - 重新运行自动断点续传: 跳过 end 时间 <= 已有数据最大时间的段
   - 全部完成后排序+去重, 写入 data/futures/ETHUSDT-5m.csv
 """
@@ -12,20 +12,22 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import fetch_data_contract as fdc  # 复用 fetch_klines / SYMBOL / OUTPUT
 
 # 强制 5m 周期 + 5m 输出文件 (模块默认是 1h)
 fdc.INTERVAL = "5m"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 fdc.OUTPUT = os.path.join(BASE_DIR, "data", "futures", "ETHUSDT-5m.csv")
 
 WORKERS = 1          # 并发请求数 (用户要求: 拉数据不要并发; 旧版 8 并发触发 418 封禁, 串行+批间隔2s 最稳)
 SEGMENT_DAYS = 90    # 每段天数 (5m: 90天=25920根 ≈ 18批)
 BATCH_SLEEP = 2.0    # 每批间隔 (降低请求速率, 防 418/限流)
 YEARS = 5            # 历史年限 (3 年已有, 补拉更早 2 年)
-PROGRESS = os.path.join(BASE_DIR, "dl_parallel_progress.txt")
-ACCUM = os.path.join(BASE_DIR, "dl_accum.jsonl")
+TEMP_DIR = os.path.join(BASE_DIR, "data", "temp")   # 下载中间产物统一放 data/temp/, 不污染主目录
+os.makedirs(TEMP_DIR, exist_ok=True)
+PROGRESS = os.path.join(TEMP_DIR, "dl_parallel_progress.txt")
+ACCUM = os.path.join(TEMP_DIR, "dl_accum.jsonl")
 ACCUM_LOCK = threading.Lock()
 MUTEX = None
 

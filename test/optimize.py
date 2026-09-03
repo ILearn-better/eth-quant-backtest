@@ -5,7 +5,7 @@ import time
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from strategies.eth_rsi_leverage import calc_rsi, calc_ma
 
 
@@ -163,7 +163,7 @@ def run_backtest_with_params(df,
 
 
 def main():
-    data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ETHUSDT-1h.csv")
+    data_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ETHUSDT-1h.csv")
     df = pd.read_csv(data_file)
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
